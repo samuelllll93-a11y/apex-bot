@@ -3,6 +3,8 @@ APEX Whale Sniper
 Monitors 4 whale wallets on Solana and mirrors their token buys via Jupiter.
 """
 
+from __future__ import annotations
+
 import os
 import asyncio
 import logging
@@ -29,7 +31,7 @@ DRY_RUN          = os.getenv("DRY_RUN", "True").lower() == "true"
 BUY_AMOUNT_SOL   = float(os.getenv("BUY_AMOUNT_SOL", "0.1"))
 MAX_SLIPPAGE_BPS = int(os.getenv("MAX_SLIPPAGE_BPS", "300"))
 
-POLL_INTERVAL_SEC = 12   # Helius free tier: ~40 req/s
+POLL_INTERVAL_SEC = 120  # 2-minute interval to reduce Helius credit usage
 
 # Whale wallets to track
 WHALE_WALLETS: dict[str, str] = {
@@ -42,10 +44,35 @@ WHALE_WALLETS: dict[str, str] = {
 # Track the last seen signature per wallet to detect new txns
 last_seen_sig: dict[str, str | None] = {name: None for name in WHALE_WALLETS}
 
+# --- Helius rate tracker ----------------------------------------------
+
+HELIUS_DAILY_WARN_LIMIT = 26_000   # ~800k credits/month ÷ 30 days
+_helius_calls: int = 0
+_helius_day_start: float = time.time()
+
+
+def _track_helius_call() -> None:
+    """Increment the Helius call counter and warn via Telegram if over daily limit."""
+    global _helius_calls, _helius_day_start
+    now = time.time()
+    if now - _helius_day_start >= 86_400:
+        _helius_calls = 0
+        _helius_day_start = now
+    _helius_calls += 1
+    if _helius_calls == HELIUS_DAILY_WARN_LIMIT:
+        msg = (
+            f"⚠️ <b>APEX whale_sniper</b> — Helius daily limit reached\n"
+            f"Made {_helius_calls:,} RPC calls today (≈800k credits/month threshold).\n"
+            f"Consider reducing scan frequency."
+        )
+        logger.warning(f"Helius daily call limit hit: {_helius_calls:,}")
+        send_telegram(msg)
+
 
 # --- RPC helpers ------------------------------------------------------
 
 def rpc_post(rpc_url: str, method: str, params: list) -> dict:
+    _track_helius_call()
     payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
     resp = requests.post(rpc_url, json=payload, timeout=10)
     resp.raise_for_status()
@@ -142,13 +169,16 @@ async def get_jupiter_quote(
         "slippageBps": str(MAX_SLIPPAGE_BPS),
     }
     url = f"{JUPITER_API}/quote"
-    try:
-        async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-            resp.raise_for_status()
-            return await resp.json()
-    except Exception as e:
-        logger.error(f"Jupiter quote failed: {e}")
-        return None
+    for attempt in range(3):
+        try:
+            async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                resp.raise_for_status()
+                return await resp.json()
+        except Exception as e:
+            logger.error(f"Jupiter quote attempt {attempt + 1}/3 failed: {e}")
+            if attempt < 2:
+                await asyncio.sleep(2)
+    return None
 
 
 async def execute_swap(
@@ -171,14 +201,17 @@ async def execute_swap(
         "prioritizationFeeLamports": "auto",
     }
     url = f"{JUPITER_API}/swap"
-    try:
-        async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=30)) as resp:
-            resp.raise_for_status()
-            data = await resp.json()
-            return data.get("txid")
-    except Exception as e:
-        logger.error(f"Jupiter swap failed: {e}")
-        return None
+    for attempt in range(3):
+        try:
+            async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                resp.raise_for_status()
+                data = await resp.json()
+                return data.get("txid")
+        except Exception as e:
+            logger.error(f"Jupiter swap attempt {attempt + 1}/3 failed: {e}")
+            if attempt < 2:
+                await asyncio.sleep(2)
+    return None
 
 
 # --- Telegram ---------------------------------------------------------

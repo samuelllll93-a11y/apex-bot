@@ -3,6 +3,8 @@ APEX Market Radar
 Scans DexScreener for new Solana tokens and uses Claude AI for analysis.
 """
 
+from __future__ import annotations
+
 import os
 import asyncio
 import logging
@@ -40,6 +42,31 @@ MAX_AGE_MINUTES   = 60
 MIN_VOLUME_5M_USD = 500
 
 claude_client = anthropic.Anthropic(api_key=os.getenv("CLAUDE_API_KEY"))
+
+# --- Helius rate tracker ----------------------------------------------
+
+HELIUS_DAILY_WARN_LIMIT = 26_000   # ~800k credits/month ÷ 30 days
+_helius_calls: int = 0
+_helius_day_start: float = time.time()
+
+
+def _track_helius_call() -> None:
+    """Increment the Helius call counter and warn via Telegram if over daily limit."""
+    global _helius_calls, _helius_day_start
+    now = time.time()
+    # Reset counter at midnight (86400s elapsed)
+    if now - _helius_day_start >= 86_400:
+        _helius_calls = 0
+        _helius_day_start = now
+    _helius_calls += 1
+    if _helius_calls == HELIUS_DAILY_WARN_LIMIT:
+        msg = (
+            f"⚠️ <b>APEX market_radar</b> — Helius daily limit reached\n"
+            f"Made {_helius_calls:,} RPC calls today (≈800k credits/month threshold).\n"
+            f"Consider reducing scan frequency."
+        )
+        logger.warning(f"Helius daily call limit hit: {_helius_calls:,}")
+        send_telegram(msg)
 
 
 # --- DexScreener ------------------------------------------------------
@@ -116,6 +143,7 @@ def get_holder_count(token_address: str, rpc_url: str) -> int | None:
         "params": [token_address],
     }
     try:
+        _track_helius_call()
         resp = requests.post(rpc_url, json=payload, timeout=5)
         resp.raise_for_status()
         result = resp.json().get("result", {})
@@ -136,6 +164,45 @@ def passes_holder_filter(holder_count: int | None, max_holders: int = 500) -> bo
         logger.warning("holder count unknown — failing open (allowing trade)")
         return True
     return holder_count < max_holders
+
+
+# --- Pre-Claude filter ------------------------------------------------
+
+# Cache: token_address -> timestamp of last Claude analysis
+seen_tokens: dict[str, float] = {}
+
+PREFILTER_MIN_MCAP    = 10_000      # $10k minimum FDV / market cap
+PREFILTER_MAX_MCAP    = 2_000_000   # $2M maximum FDV / market cap
+PREFILTER_MIN_VOL_H1  = 5_000       # $5k minimum 1h volume
+PREFILTER_RECHECK_SEC = 7_200       # 2 hours before re-analysing same token
+
+
+def passes_pre_claude_filter(pair: dict) -> tuple[bool, str]:
+    """
+    Cheap checks run BEFORE calling Claude to avoid wasting API credits.
+    Returns (True, '') if the token should be sent to Claude, else (False, reason).
+    """
+    token_address = pair.get("baseToken", {}).get("address", "")
+
+    # --- Seen-token cache: skip if analysed within the last 2 hours ---
+    last_seen = seen_tokens.get(token_address)
+    if last_seen and (time.time() - last_seen) < PREFILTER_RECHECK_SEC:
+        age_min = int((time.time() - last_seen) / 60)
+        return False, f"already analysed {age_min}m ago"
+
+    # --- FDV / market cap range ---
+    fdv = pair.get("fdv") or 0
+    if fdv < PREFILTER_MIN_MCAP:
+        return False, f"FDV ${fdv:,.0f} below ${PREFILTER_MIN_MCAP:,}"
+    if fdv > PREFILTER_MAX_MCAP:
+        return False, f"FDV ${fdv:,.0f} above ${PREFILTER_MAX_MCAP:,}"
+
+    # --- 1h volume ---
+    vol_h1 = (pair.get("volume") or {}).get("h1", 0) or 0
+    if vol_h1 < PREFILTER_MIN_VOL_H1:
+        return False, f"1h volume ${vol_h1:,.0f} below ${PREFILTER_MIN_VOL_H1:,}"
+
+    return True, ""
 
 
 # --- Claude AI analysis -----------------------------------------------
@@ -209,13 +276,16 @@ async def get_jupiter_quote(
         "slippageBps":      str(MAX_SLIPPAGE_BPS),
     }
     url = f"{JUPITER_API}/quote"
-    try:
-        async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-            resp.raise_for_status()
-            return await resp.json()
-    except Exception as e:
-        logger.error(f"Jupiter quote failed: {e}")
-        return None
+    for attempt in range(3):
+        try:
+            async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                resp.raise_for_status()
+                return await resp.json()
+        except Exception as e:
+            logger.error(f"Jupiter quote attempt {attempt + 1}/3 failed: {e}")
+            if attempt < 2:
+                await asyncio.sleep(2)
+    return None
 
 
 async def execute_swap(
@@ -239,14 +309,17 @@ async def execute_swap(
         "prioritizationFeeLamports": "auto",
     }
     url = f"{JUPITER_API}/swap"
-    try:
-        async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=30)) as resp:
-            resp.raise_for_status()
-            data = await resp.json()
-            return data.get("txid")
-    except Exception as e:
-        logger.error(f"Jupiter swap failed: {e}")
-        return None
+    for attempt in range(3):
+        try:
+            async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                resp.raise_for_status()
+                data = await resp.json()
+                return data.get("txid")
+        except Exception as e:
+            logger.error(f"Jupiter swap attempt {attempt + 1}/3 failed: {e}")
+            if attempt < 2:
+                await asyncio.sleep(2)
+    return None
 
 
 # --- Telegram ---------------------------------------------------------
@@ -304,6 +377,13 @@ async def run():
                             logger.info(f"Skipping {token_address[:8]} — too many holders ({holder_count})")
                             continue
 
+                        ok_pre, pre_reason = passes_pre_claude_filter(pair)
+                        if not ok_pre:
+                            logger.debug(f"Pre-Claude filter blocked {token_address[:8]} — {pre_reason}")
+                            continue
+
+                        # Stamp before Claude call so concurrent loops don't double-analyse
+                        seen_tokens[token_address] = time.time()
                         analysis = analyze_token_with_claude(pair, holder_count)
                         score    = analysis.get("score", 0)
                         rec      = analysis.get("recommendation", "SKIP")
@@ -331,7 +411,7 @@ async def run():
             except Exception as e:
                 logger.error(f"Radar loop error: {e}", exc_info=True)
 
-            await asyncio.sleep(15)
+            await asyncio.sleep(120)
 
 
 if __name__ == "__main__":
