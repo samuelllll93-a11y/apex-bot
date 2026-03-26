@@ -216,19 +216,31 @@ async def execute_swap(
 
 # --- Telegram ---------------------------------------------------------
 
-def send_telegram(message: str) -> None:
+def send_telegram(message: str) -> bool:
+    """
+    Send a Telegram message.  Returns True on success, False on any failure.
+    Logs ERROR (not just WARNING) so failures are always visible in pm2 logs.
+    """
     token   = os.getenv("TELEGRAM_BOT_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
     if not token or not chat_id:
-        return
+        logger.error("send_telegram: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set — alert dropped")
+        return False
     try:
-        requests.post(
+        resp = requests.post(
             f"https://api.telegram.org/bot{token}/sendMessage",
             json={"chat_id": chat_id, "text": message, "parse_mode": "HTML"},
             timeout=5,
         )
+        resp.raise_for_status()   # raises on 4xx / 5xx — was previously missing
+        logger.info(f"Telegram alert sent (message_id={resp.json().get('result',{}).get('message_id')})")
+        return True
+    except requests.exceptions.HTTPError as e:
+        logger.error(f"Telegram HTTP error {e.response.status_code}: {e.response.text}")
+        return False
     except Exception as e:
-        logger.warning(f"Telegram send failed: {e}")
+        logger.error(f"Telegram send failed: {e}")
+        return False
 
 
 # --- Main loop --------------------------------------------------------
