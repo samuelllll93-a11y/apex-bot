@@ -37,8 +37,8 @@ MAX_SLIPPAGE_BPS = int(os.getenv("MAX_SLIPPAGE_BPS", "300"))
 SOL_MINT         = "So11111111111111111111111111111111111111112"
 
 # Rough filter thresholds
-MIN_LIQUIDITY_USD = 5_000
-MAX_AGE_MINUTES   = 60
+MIN_LIQUIDITY_USD = 30_000
+MAX_AGE_MINUTES   = 120
 MIN_VOLUME_5M_USD = 500
 
 claude_client = anthropic.Anthropic(api_key=os.getenv("CLAUDE_API_KEY"))
@@ -210,18 +210,29 @@ def passes_pre_claude_filter(pair: dict) -> tuple[bool, str]:
 def analyze_token_with_claude(pair: dict, holder_count: int | None) -> dict:
     """
     Ask Claude to score the token on a 1-10 scale and provide reasoning.
-    Returns dict with keys: score (int), reasoning (str), recommendation (str).
+    Returns dict with keys: score (int), reasoning (str), recommendation (str),
+    deciding_factor (str), age_minutes (float | None).
     """
     token_name    = pair.get("baseToken", {}).get("name", "Unknown")
     token_symbol  = pair.get("baseToken", {}).get("symbol", "?")
     token_address = pair.get("baseToken", {}).get("address", "")
     dex_id        = pair.get("dexId", "")
     price_usd     = pair.get("priceUsd", "unknown")
-    liquidity_usd = (pair.get("liquidity") or {}).get("usd", 0)
-    volume_5m     = (pair.get("volume") or {}).get("m5", 0)
-    volume_h1     = (pair.get("volume") or {}).get("h1", 0)
-    price_change  = (pair.get("priceChange") or {}).get("m5", 0)
-    fdv           = pair.get("fdv", 0)
+    liquidity_usd = (pair.get("liquidity") or {}).get("usd", 0) or 0
+    volume_5m     = (pair.get("volume") or {}).get("m5", 0) or 0
+    volume_h1     = (pair.get("volume") or {}).get("h1", 0) or 0
+    price_chg_m5  = (pair.get("priceChange") or {}).get("m5", 0) or 0
+    price_chg_m15 = (pair.get("priceChange") or {}).get("m15", 0) or 0
+    price_chg_h1  = (pair.get("priceChange") or {}).get("h1", 0) or 0
+    fdv           = pair.get("fdv", 0) or 0
+
+    # Volume/Liquidity ratio — primary momentum signal
+    vl_ratio = round(volume_5m / liquidity_usd, 2) if liquidity_usd > 0 else 0
+
+    # Token age in minutes (Change C)
+    pair_created_at = pair.get("pairCreatedAt")
+    age_minutes = round((time.time() * 1000 - pair_created_at) / 60_000, 1) if pair_created_at else None
+    age_str = f"{age_minutes}m" if age_minutes is not None else "unknown"
 
     prompt = f"""You are a Solana meme coin risk analyst. Evaluate this newly listed token for a short-term trade (flip within 30 minutes).
 
@@ -230,17 +241,25 @@ Address: {token_address}
 DEX: {dex_id}
 Price: ${price_usd}
 Liquidity: ${liquidity_usd:,.0f}
-5m Volume: ${volume_5m:,.0f}
+5m Volume: ${volume_5m:,.0f} | Vol/Liquidity ratio: {vl_ratio}x
 1h Volume: ${volume_h1:,.0f}
-5m Price Change: {price_change}%
+Price Change — 5m: {price_chg_m5}% | 15m: {price_chg_m15}% | 1h: {price_chg_h1}%
 FDV: ${fdv:,.0f}
+Token Age: {age_str}
 Holder Count: {holder_count if holder_count is not None else "unknown"}
 
-Score this token 1-10 for short-term trade potential (10 = strong buy, 1 = avoid).
-Consider: liquidity depth, volume momentum, FDV vs liquidity ratio, holder distribution red flags.
+SCORING RULES (apply in order):
+1. Vol/Liquidity ratio >10x = strong momentum signal, weight this MOST HEAVILY (+2 pts)
+2. Price gains sustained across 5m, 15m, and 1h = trend confirmation (+2 pts)
+3. FDV/Liquidity ratio <5x = healthy token structure (+1 pt)
+4. If Holder Count is "unknown": do NOT penalise — score on the other factors only
+5. Flat or declining volume across timeframes = strong negative signal (-2 pts)
+6. Price already dumping (negative 5m AND negative 15m) = score 1-2, avoid
+
+Score 1-10 for short-term trade potential (7+ = BUY, <7 = SKIP).
 
 Respond with JSON only:
-{{"score": <int 1-10>, "reasoning": "<one sentence>", "recommendation": "BUY" | "SKIP"}}"""
+{{"score": <int 1-10>, "reasoning": "<one sentence>", "recommendation": "BUY" | "SKIP", "deciding_factor": "<volume_momentum|price_trend|fdv_ratio|holder_distribution|liquidity>"}}"""
 
     try:
         message = claude_client.messages.create(
@@ -255,10 +274,12 @@ Respond with JSON only:
             text = text.split("```")[1]
             if text.startswith("json"):
                 text = text[4:]
-        return json.loads(text.strip())
+        result = json.loads(text.strip())
+        result["age_minutes"] = age_minutes
+        return result
     except Exception as e:
         logger.error(f"Claude analysis failed: {e}")
-        return {"score": 0, "reasoning": "analysis failed", "recommendation": "SKIP"}
+        return {"score": 0, "reasoning": "analysis failed", "recommendation": "SKIP", "age_minutes": age_minutes}
 
 
 # --- Jupiter swap -----------------------------------------------------
@@ -339,6 +360,21 @@ def send_telegram(message: str) -> None:
         logger.warning(f"Telegram send failed: {e}")
 
 
+# --- Skip reason classifier -------------------------------------------
+
+def _skip_reason(reason: str) -> str:
+    """Map a filter rejection string to a structured SKIP_REASON tag."""
+    r = reason.lower()
+    if "liquidity"      in r: return "SKIP_REASON:liquidity"
+    if "age"            in r or "exceeds" in r: return "SKIP_REASON:age"
+    if "volume"         in r: return "SKIP_REASON:volume"
+    if "dexid"          in r or "dex"   in r: return "SKIP_REASON:dex"
+    if "fdv"            in r: return "SKIP_REASON:fdv"
+    if "already"        in r: return "SKIP_REASON:duplicate"
+    if "holder"         in r: return "SKIP_REASON:holders"
+    return "SKIP_REASON:other"
+
+
 # --- Main loop --------------------------------------------------------
 
 async def run():
@@ -366,20 +402,22 @@ async def run():
                             continue
                         seen_pairs.add(pair_address)
 
+                        symbol = pair.get("baseToken", {}).get("symbol", "?")
+
                         ok, reason = passes_basic_filters(pair)
                         if not ok:
-                            logger.debug(f"Skipping {token_address[:8]} — {reason}")
+                            logger.info(f"SKIP | {symbol} | {_skip_reason(reason)} | {reason}")
                             continue
 
                         holder_count = get_holder_count(token_address, rpc_url) if rpc_url else None
 
                         if not passes_holder_filter(holder_count):
-                            logger.info(f"Skipping {token_address[:8]} — too many holders ({holder_count})")
+                            logger.info(f"SKIP | {symbol} | SKIP_REASON:holders | too many holders ({holder_count})")
                             continue
 
                         ok_pre, pre_reason = passes_pre_claude_filter(pair)
                         if not ok_pre:
-                            logger.debug(f"Pre-Claude filter blocked {token_address[:8]} — {pre_reason}")
+                            logger.info(f"SKIP | {symbol} | {_skip_reason(pre_reason)} | {pre_reason}")
                             continue
 
                         # Stamp before Claude call so concurrent loops don't double-analyse
@@ -387,11 +425,13 @@ async def run():
                         analysis = analyze_token_with_claude(pair, holder_count)
                         score    = analysis.get("score", 0)
                         rec      = analysis.get("recommendation", "SKIP")
+                        age_min  = analysis.get("age_minutes")
+                        age_tag  = f"age={age_min}m" if age_min is not None else "age=unknown"
+                        factor   = analysis.get("deciding_factor", "unknown")
 
-                        symbol = pair.get("baseToken", {}).get("symbol", "?")
                         logger.info(
-                            f"{symbol} | score={score}/10 | {rec} | "
-                            f"{analysis.get('reasoning','')}"
+                            f"SCORED | {symbol} | score={score}/10 | {rec} | {age_tag} | "
+                            f"DECIDING_FACTOR:{factor} | {analysis.get('reasoning','')}"
                         )
 
                         if rec == "BUY" and score >= 7:
