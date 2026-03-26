@@ -404,23 +404,37 @@ async def run():
 
                         symbol = pair.get("baseToken", {}).get("symbol", "?")
 
+                        # ── 1. Cheap early-out: token already analysed this cycle ──────
+                        # Must run BEFORE passes_basic_filters so that a second low-liq
+                        # pair of an already-scored token never produces a misleading
+                        # SKIP_REASON:liquidity log line after a SCORED line.
+                        if token_address in seen_tokens and \
+                                (time.time() - seen_tokens[token_address]) < PREFILTER_RECHECK_SEC:
+                            continue
+
+                        # ── 2. Cheap structural filters (DEX, liquidity, age, volume) ──
                         ok, reason = passes_basic_filters(pair)
                         if not ok:
                             logger.info(f"SKIP | {symbol} | {_skip_reason(reason)} | {reason}")
                             continue
 
+                        # ── 3. Cheap pre-Claude filters (FDV range, 1h vol) ────────────
+                        # Runs BEFORE the expensive Helius call so bad FDV/volume tokens
+                        # never consume an RPC credit.
+                        ok_pre, pre_reason = passes_pre_claude_filter(pair)
+                        if not ok_pre:
+                            logger.info(f"SKIP | {symbol} | {_skip_reason(pre_reason)} | {pre_reason}")
+                            continue
+
+                        # ── 4. Expensive Helius RPC — holder count ─────────────────────
                         holder_count = get_holder_count(token_address, rpc_url) if rpc_url else None
 
                         if not passes_holder_filter(holder_count):
                             logger.info(f"SKIP | {symbol} | SKIP_REASON:holders | too many holders ({holder_count})")
                             continue
 
-                        ok_pre, pre_reason = passes_pre_claude_filter(pair)
-                        if not ok_pre:
-                            logger.info(f"SKIP | {symbol} | {_skip_reason(pre_reason)} | {pre_reason}")
-                            continue
-
-                        # Stamp before Claude call so concurrent loops don't double-analyse
+                        # ── 5. Expensive Claude API call ───────────────────────────────
+                        # Stamp first so concurrent pair iterations don't double-analyse.
                         seen_tokens[token_address] = time.time()
                         analysis = analyze_token_with_claude(pair, holder_count)
                         score    = analysis.get("score", 0)
