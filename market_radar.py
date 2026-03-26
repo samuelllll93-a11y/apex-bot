@@ -29,7 +29,7 @@ DEXSCREENER_API  = "https://api.dexscreener.com/latest/dex/tokens"
 SOLANA_CHAIN     = "solana"
 
 # Bug fix #2: include pumpswap alongside raydium and pump
-ALLOWED_DEX_IDS  = {"raydium", "pump", "pumpswap"}
+ALLOWED_DEX_IDS  = {"raydium", "pump", "pumpswap", "pumpfun", "meteora", "meteoradlmm", "orca", "whirlpool"}
 
 DRY_RUN          = os.getenv("DRY_RUN", "True").lower() == "true"
 BUY_AMOUNT_SOL   = float(os.getenv("BUY_AMOUNT_SOL", "0.1"))
