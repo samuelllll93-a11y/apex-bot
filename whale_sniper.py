@@ -29,9 +29,10 @@ WSOL_MINT        = "So11111111111111111111111111111111111111112"
 
 DRY_RUN          = os.getenv("DRY_RUN", "True").lower() == "true"
 BUY_AMOUNT_SOL   = float(os.getenv("BUY_AMOUNT_SOL", "0.1"))
-MAX_SLIPPAGE_BPS = int(os.getenv("MAX_SLIPPAGE_BPS", "300"))
+MAX_SLIPPAGE_BPS = int(os.getenv("MAX_SLIPPAGE_BPS", "1500"))
 
 POLL_INTERVAL_SEC = 120  # 2-minute interval to reduce Helius credit usage
+LOW_BALANCE_SOL   = float(os.getenv("LOW_BALANCE_SOL", "0.05"))  # skip trade + alert if below
 
 # Whale wallets to track
 WHALE_WALLETS: dict[str, str] = {
@@ -113,6 +114,21 @@ def get_transaction(rpc_url: str, sig: str) -> dict | None:
     except Exception as e:
         logger.warning(f"getTransaction failed for {sig[:16]}: {e}")
         return None
+
+
+def get_sol_balance(rpc_url: str, wallet_pubkey: str) -> float:
+    """Return wallet SOL balance in SOL. Returns 0.0 on any RPC error."""
+    try:
+        result = rpc_post(
+            rpc_url,
+            "getBalance",
+            [wallet_pubkey, {"commitment": "confirmed"}],
+        )
+        lamports = (result.get("result") or {}).get("value", 0)
+        return lamports / 1_000_000_000
+    except Exception as e:
+        logger.error(f"getBalance failed for {wallet_pubkey[:8]}: {e}")
+        return 0.0
 
 
 # --- Trade detection --------------------------------------------------
@@ -330,10 +346,28 @@ async def poll_whale(
             buy_sol = BUY_AMOUNT_SOL
         # ---------------------------------------------------------------
 
+        # --- Pre-trade SOL balance guard --------------------------------
+        sol_balance = get_sol_balance(rpc_url, wallet_pubkey)
+        if sol_balance < LOW_BALANCE_SOL:
+            alert = (
+                f"⚠️ <b>LOW BALANCE</b> — {sol_balance:.4f} SOL remaining\n"
+                f"Skipping trade on <code>{token_mint[:8]}</code>\n"
+                f"Top up wallet before next signal fires."
+            )
+            logger.warning(f"[{name}] LOW BALANCE {sol_balance:.4f} SOL — skipping trade on {token_mint[:8]}")
+            send_telegram(alert)
+            continue
+        logger.info(f"[{name}] Balance OK: {sol_balance:.4f} SOL (min={LOW_BALANCE_SOL} SOL)")
+        # ----------------------------------------------------------------
+
         amount_lamports = int(buy_sol * 1_000_000_000)
         quote = await get_jupiter_quote(session, token_mint, amount_lamports)
         if not quote:
-            logger.warning(f"[{name}] No Jupiter quote for {token_mint[:8]}")
+            logger.error(
+                f"[{name}] SKIP — Jupiter quote failed after 3 attempts "
+                f"for {token_mint[:8]} (token may lack Jupiter liquidity or "
+                f"slippage tolerance too tight)"
+            )
             continue
 
         swap_sig = await execute_swap(session, quote, wallet_pubkey)
