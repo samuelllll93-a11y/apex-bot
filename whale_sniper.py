@@ -44,6 +44,14 @@ WHALE_WALLETS: dict[str, str] = {
 # Track the last seen signature per wallet to detect new txns
 last_seen_sig: dict[str, str | None] = {name: None for name in WHALE_WALLETS}
 
+# Whale activity log: name -> list of (mint, timestamp) for all buys
+_whale_activity: dict[str, list[tuple[str, float]]] = {name: [] for name in WHALE_WALLETS}
+
+CONVICTION_WINDOW_SEC = 1_800   # 30 min  — double-buy detection window
+CONVICTION_MULTIPLIER = 1.5     # position multiplier on high-conviction signal
+ACTIVITY_WINDOW_SEC   = 86_400  # 24 h    — HOT / COLD scoring window
+HOT_THRESHOLD         = 3       # buys in 24 h to be classified HOT
+
 # --- Helius rate tracker ----------------------------------------------
 
 HELIUS_DAILY_WARN_LIMIT = 26_000   # ~800k credits/month ÷ 30 days
@@ -288,7 +296,41 @@ async def poll_whale(
 
         logger.info(f"[{name}] BUY signal → {token_mint}")
 
-        amount_lamports = int(BUY_AMOUNT_SOL * 1_000_000_000)
+        # --- Conviction + activity tracking ----------------------------
+        now = time.time()
+
+        # Prune entries outside the 24 h activity window
+        _whale_activity[name] = [
+            (m, t) for m, t in _whale_activity[name]
+            if now - t < ACTIVITY_WINDOW_SEC
+        ]
+
+        # Double conviction: same mint bought by this whale in last 30 min?
+        prior_30m = [
+            (m, t) for m, t in _whale_activity[name]
+            if now - t < CONVICTION_WINDOW_SEC
+        ]
+        is_high_conviction = any(m == token_mint for m, t in prior_30m)
+
+        # Record current buy, then recount
+        _whale_activity[name].append((token_mint, now))
+        buys_24h = len(_whale_activity[name])
+
+        # HOT whale log — fires each time the threshold is crossed / maintained
+        if buys_24h >= HOT_THRESHOLD:
+            logger.info(f"[{name.upper()}] HOT WHALE 🔥 ({buys_24h} buys in 24h)")
+
+        # Position sizing
+        if is_high_conviction:
+            buy_sol = round(BUY_AMOUNT_SOL * CONVICTION_MULTIPLIER, 4)
+            logger.info(
+                f"[{name.upper()}] HIGH CONVICTION — double buy detected on {token_mint[:8]}"
+            )
+        else:
+            buy_sol = BUY_AMOUNT_SOL
+        # ---------------------------------------------------------------
+
+        amount_lamports = int(buy_sol * 1_000_000_000)
         quote = await get_jupiter_quote(session, token_mint, amount_lamports)
         if not quote:
             logger.warning(f"[{name}] No Jupiter quote for {token_mint[:8]}")
@@ -296,10 +338,19 @@ async def poll_whale(
 
         swap_sig = await execute_swap(session, quote, wallet_pubkey)
 
+        # High conviction gets its own priority Telegram alert first
+        if is_high_conviction:
+            send_telegram(
+                f"🔥 <b>HIGH CONVICTION</b> — [{name.upper()}] bought "
+                f"<code>{token_mint[:8]}</code> twice in 30 mins\n"
+                f"Position size: {buy_sol} SOL ({CONVICTION_MULTIPLIER}x normal)"
+            )
+
         msg = (
             f"🐋 <b>APEX WHALE COPY</b> [{name.upper()}]\n"
+            f"{'🔥 HIGH CONVICTION\n' if is_high_conviction else ''}"
             f"Token: <code>{token_mint}</code>\n"
-            f"Amount: {BUY_AMOUNT_SOL} SOL\n"
+            f"Amount: {buy_sol} SOL\n"
             f"Whale sig: <code>{sig}</code>\n"
             f"Our sig: <code>{swap_sig}</code>"
         )
@@ -317,6 +368,9 @@ async def run():
 
     logger.info(f"Whale Sniper starting — DRY_RUN={DRY_RUN}")
     logger.info(f"Tracking {len(WHALE_WALLETS)} whales: {', '.join(WHALE_WALLETS)}")
+    # At startup no 24 h activity is recorded — all whales are cold
+    for wname in WHALE_WALLETS:
+        logger.info(f"[{wname.upper()}] COLD WHALE ❄️ (no activity recorded yet)")
 
     async with aiohttp.ClientSession() as session:
         while True:

@@ -36,10 +36,21 @@ BUY_AMOUNT_SOL   = float(os.getenv("BUY_AMOUNT_SOL", "0.1"))
 MAX_SLIPPAGE_BPS = int(os.getenv("MAX_SLIPPAGE_BPS", "300"))
 SOL_MINT         = "So11111111111111111111111111111111111111112"
 
-# Rough filter thresholds
-MIN_LIQUIDITY_USD = 30_000
-MAX_AGE_MINUTES   = 120
-MIN_VOLUME_5M_USD = 500
+# Rough filter thresholds — liquidity is time-gated (peak vs off-peak UTC)
+LIQUIDITY_PEAK_USD    = 30_000   # UTC 12:00–22:00 (busy market hours)
+LIQUIDITY_OFFPEAK_USD = 20_000   # UTC 22:00–12:00 (quiet overnight hours)
+PEAK_START_UTC        = 12
+PEAK_END_UTC          = 22
+MAX_AGE_MINUTES       = 120
+MIN_VOLUME_5M_USD     = 500
+
+
+def _min_liquidity_usd() -> int:
+    """Return the active liquidity threshold based on current UTC hour."""
+    hour = time.gmtime().tm_hour
+    if PEAK_START_UTC <= hour < PEAK_END_UTC:
+        return LIQUIDITY_PEAK_USD
+    return LIQUIDITY_OFFPEAK_USD
 
 claude_client = anthropic.Anthropic(api_key=os.getenv("CLAUDE_API_KEY"))
 
@@ -111,10 +122,11 @@ def passes_basic_filters(pair: dict) -> tuple[bool, str]:
     if dex_id not in ALLOWED_DEX_IDS:
         return False, f"dexId '{dex_id}' not in allowed list"
 
-    # Liquidity check
+    # Liquidity check — threshold varies by UTC hour (peak vs off-peak)
     liquidity = (pair.get("liquidity") or {}).get("usd", 0) or 0
-    if liquidity < MIN_LIQUIDITY_USD:
-        return False, f"liquidity ${liquidity:.0f} below ${MIN_LIQUIDITY_USD}"
+    min_liq = _min_liquidity_usd()
+    if liquidity < min_liq:
+        return False, f"liquidity ${liquidity:.0f} below ${min_liq:,} threshold"
 
     # Age check
     pair_created_at = pair.get("pairCreatedAt")
@@ -387,6 +399,11 @@ async def run():
     async with aiohttp.ClientSession() as session:
         while True:
             try:
+                utc_hour = time.gmtime().tm_hour
+                logger.info(
+                    f"Scan cycle | UTC {utc_hour:02d}:xx | "
+                    f"MIN_LIQUIDITY=${_min_liquidity_usd():,}"
+                )
                 profiles = await fetch_new_tokens(session)
 
                 for profile in profiles:
