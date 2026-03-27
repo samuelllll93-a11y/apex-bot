@@ -380,9 +380,10 @@ async def poll_whale(
                 f"Position size: {buy_sol} SOL ({CONVICTION_MULTIPLIER}x normal)"
             )
 
+        conviction_badge = "🔥 HIGH CONVICTION\n" if is_high_conviction else ""
         msg = (
             f"🐋 <b>APEX WHALE COPY</b> [{name.upper()}]\n"
-            f"{'🔥 HIGH CONVICTION\n' if is_high_conviction else ''}"
+            f"{conviction_badge}"
             f"Token: <code>{token_mint}</code>\n"
             f"Amount: {buy_sol} SOL\n"
             f"Whale sig: <code>{sig}</code>\n"
