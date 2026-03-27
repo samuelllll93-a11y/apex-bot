@@ -54,6 +54,15 @@ CONVICTION_MULTIPLIER = 1.5     # position multiplier on high-conviction signal
 ACTIVITY_WINDOW_SEC   = 86_400  # 24 h    — HOT / COLD scoring window
 HOT_THRESHOLD         = 3       # buys in 24 h to be classified HOT
 
+# --- Sell / exit parameters -------------------------------------------
+TAKE_PROFIT_PCT    = 50.0   # exit if SOL value up ≥ 50 % from entry
+TRAILING_STOP_PCT  = 15.0   # exit if SOL value drops ≥ 15 % from peak
+TIME_STOP_MIN      = 30     # force-close after this many minutes
+POSITION_CHECK_SEC = 30     # how often the sell monitor loop runs
+
+# Open positions: token_mint → position dict (populated after every buy)
+open_positions: dict[str, dict] = {}
+
 # --- Helius rate tracker ----------------------------------------------
 
 HELIUS_DAILY_WARN_LIMIT = 26_000   # ~800k credits/month ÷ 30 days
@@ -220,6 +229,31 @@ async def get_jupiter_quote(
     return None
 
 
+async def get_sell_quote(
+    session: aiohttp.ClientSession,
+    token_mint: str,
+    amount_tokens: int,
+) -> dict | None:
+    """Get a Jupiter quote for selling amount_tokens of token_mint → SOL."""
+    params = {
+        "inputMint":   token_mint,
+        "outputMint":  SOL_MINT,
+        "amount":      str(amount_tokens),
+        "slippageBps": str(MAX_SLIPPAGE_BPS),
+    }
+    url = f"{JUPITER_API}/quote"
+    for attempt in range(3):
+        try:
+            async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                resp.raise_for_status()
+                return await resp.json()
+        except Exception as e:
+            logger.error(f"Sell quote attempt {attempt + 1}/3 failed for {token_mint[:8]}: {e}")
+            if attempt < 2:
+                await asyncio.sleep(2)
+    return None
+
+
 async def execute_swap(
     session: aiohttp.ClientSession,
     quote: dict,
@@ -280,6 +314,98 @@ def send_telegram(message: str) -> bool:
     except Exception as e:
         logger.error(f"Telegram send failed: {e}")
         return False
+
+
+# --- Position exit logic ----------------------------------------------
+
+async def check_and_maybe_exit(
+    session: aiohttp.ClientSession,
+    token_mint: str,
+    wallet_pubkey: str,
+) -> None:
+    """
+    Evaluate one open position against all three exit conditions.
+    Executes sell and clears position if any condition is met.
+    """
+    pos = open_positions.get(token_mint)
+    if pos is None:
+        return  # already closed by a concurrent check
+
+    # Fetch current sell value
+    sell_quote = await get_sell_quote(session, token_mint, pos["amount_tokens"])
+    if sell_quote is None:
+        logger.warning(
+            f"[{token_mint[:8]}] sell quote failed this tick — retrying next cycle"
+        )
+        return  # keep position open; try again in POSITION_CHECK_SEC
+
+    current_sol    = int(sell_quote.get("outAmount", 0)) / 1_000_000_000
+    entry_sol      = pos["entry_sol"]
+    peak_sol       = pos["peak_sol"]
+    elapsed_min    = (time.time() - pos["entry_time"]) / 60
+
+    # Update peak if price has moved up
+    if current_sol > peak_sol:
+        open_positions[token_mint]["peak_sol"] = current_sol
+        peak_sol = current_sol
+
+    pnl_pct       = (current_sol / entry_sol - 1) * 100 if entry_sol > 0 else 0.0
+    drop_from_peak = (current_sol / peak_sol  - 1) * 100 if peak_sol  > 0 else 0.0
+
+    logger.debug(
+        f"[{token_mint[:8]}] hold — pnl={pnl_pct:+.1f}% | "
+        f"peak_drop={drop_from_peak:.1f}% | {elapsed_min:.0f}m elapsed"
+    )
+
+    # Check exit conditions (take profit first — never cut a winner early)
+    exit_reason = None
+    if pnl_pct >= TAKE_PROFIT_PCT:
+        exit_reason = f"TAKE PROFIT +{pnl_pct:.1f}%"
+    elif drop_from_peak <= -TRAILING_STOP_PCT:
+        exit_reason = (
+            f"TRAILING STOP {pnl_pct:+.1f}% "
+            f"(dropped {abs(drop_from_peak):.1f}% from peak)"
+        )
+    elif elapsed_min >= TIME_STOP_MIN:
+        exit_reason = f"TIME STOP ({elapsed_min:.0f}m elapsed)"
+
+    if exit_reason is None:
+        return  # no exit condition met this tick
+
+    # --- Execute sell --------------------------------------------------
+    if DRY_RUN:
+        sell_sig = "DRY_RUN_SELL_SIG"
+        logger.info(
+            f"[DRY RUN] Would sell {pos['amount_tokens']:,} tokens → "
+            f"{current_sol:.4f} SOL ({exit_reason})"
+        )
+    else:
+        sell_sig = await execute_swap(session, sell_quote, wallet_pubkey)
+        if not sell_sig:
+            logger.error(
+                f"[{token_mint[:8]}] Sell swap failed — keeping position open, "
+                f"will retry next cycle. Trigger was: {exit_reason}"
+            )
+            return  # don't clear position if live sell tx failed
+
+    pnl_sign = "+" if pnl_pct >= 0 else ""
+    emoji    = "💰" if pnl_pct >= 0 else "🛑"
+
+    # Remove from open_positions *before* logging so monitor doesn't re-enter
+    del open_positions[token_mint]
+
+    logger.info(
+        f"[{token_mint[:8]}] {exit_reason} | "
+        f"Entry: {entry_sol:.4f} SOL | Exit: {current_sol:.4f} SOL | "
+        f"PnL: {pnl_sign}{pnl_pct:.1f}%"
+    )
+    send_telegram(
+        f"{emoji} <b>SELL [{token_mint[:8]}]</b>\n"
+        f"Reason: {exit_reason}\n"
+        f"Entry: {entry_sol:.4f} SOL | Exit: {current_sol:.4f} SOL\n"
+        f"PnL: {pnl_sign}{pnl_pct:.1f}%\n"
+        f"Sig: <code>{sell_sig}</code>"
+    )
 
 
 # --- Startup diagnostics ----------------------------------------------
@@ -454,6 +580,52 @@ async def poll_whale(
         logger.info(msg)
         send_telegram(msg)
 
+        # --- Register open position for sell monitoring ----------------
+        token_units = int(quote.get("outAmount", 0))
+        entry_sol   = int(quote.get("inAmount",  0)) / 1_000_000_000
+        if token_units > 0:
+            open_positions[token_mint] = {
+                "entry_time":    time.time(),
+                "entry_sol":     entry_sol,
+                "peak_sol":      entry_sol,   # starts equal to entry
+                "amount_tokens": token_units,
+                "whale":         name,
+                "buy_sol":       buy_sol,
+            }
+            logger.info(
+                f"[{token_mint[:8]}] Position opened — "
+                f"{token_units:,} tokens | entry {entry_sol:.4f} SOL"
+            )
+        # ---------------------------------------------------------------
+
+
+async def position_monitor_loop(
+    session: aiohttp.ClientSession,
+    wallet_pubkey: str,
+) -> None:
+    """Check all open positions for exit conditions every POSITION_CHECK_SEC seconds."""
+    while True:
+        await asyncio.sleep(POSITION_CHECK_SEC)
+        count = len(open_positions)
+        logger.info(f"Position monitor: checking {count} open position(s)")
+        for token_mint in list(open_positions.keys()):
+            await check_and_maybe_exit(session, token_mint, wallet_pubkey)
+
+
+async def whale_poll_loop(
+    session: aiohttp.ClientSession,
+    rpc_url: str,
+    wallet_pubkey: str,
+) -> None:
+    """Poll all whale wallets for new buys every POLL_INTERVAL_SEC seconds."""
+    while True:
+        tasks = [
+            poll_whale(session, name, wallet, rpc_url, wallet_pubkey)
+            for name, wallet in WHALE_WALLETS.items()
+        ]
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.sleep(POLL_INTERVAL_SEC)
+
 
 async def run():
     rpc_url       = os.getenv("SOLANA_RPC", "")
@@ -475,15 +647,13 @@ async def run():
         logger.info(f"[{wname.upper()}] COLD WHALE ❄️ (no activity recorded yet)")
 
     startup_checks(rpc_url, wallet_pubkey)
+    logger.info(f"Position monitor: {len(open_positions)} open position(s) at startup")
 
     async with aiohttp.ClientSession() as session:
-        while True:
-            tasks = [
-                poll_whale(session, name, wallet, rpc_url, wallet_pubkey)
-                for name, wallet in WHALE_WALLETS.items()
-            ]
-            await asyncio.gather(*tasks, return_exceptions=True)
-            await asyncio.sleep(POLL_INTERVAL_SEC)
+        await asyncio.gather(
+            whale_poll_loop(session, rpc_url, wallet_pubkey),
+            position_monitor_loop(session, wallet_pubkey),
+        )
 
 
 if __name__ == "__main__":
