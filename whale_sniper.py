@@ -6,6 +6,7 @@ Monitors 4 whale wallets on Solana and mirrors their token buys via Jupiter.
 from __future__ import annotations
 
 import os
+import re
 import asyncio
 import logging
 import time
@@ -118,16 +119,30 @@ def get_transaction(rpc_url: str, sig: str) -> dict | None:
 
 def get_sol_balance(rpc_url: str, wallet_pubkey: str) -> float:
     """Return wallet SOL balance in SOL. Returns 0.0 on any RPC error."""
+    if not wallet_pubkey:
+        logger.error("get_sol_balance: wallet_pubkey is empty — WALLET_PUBLIC_KEY not set in .env")
+        return 0.0
     try:
-        result = rpc_post(
-            rpc_url,
-            "getBalance",
-            [wallet_pubkey, {"commitment": "confirmed"}],
-        )
-        lamports = (result.get("result") or {}).get("value", 0)
+        result   = rpc_post(rpc_url, "getBalance",
+                            [wallet_pubkey, {"commitment": "confirmed"}])
+        raw      = result.get("result")
+        rpc_err  = result.get("error")
+        if rpc_err:
+            logger.error(
+                f"getBalance RPC error for {wallet_pubkey[:8]}…: {rpc_err} "
+                f"— check WALLET_PUBLIC_KEY is a base58 address, not a private key"
+            )
+            return 0.0
+        if raw is None:
+            logger.error(
+                f"getBalance returned null result for {wallet_pubkey[:8]}…"
+                f" — full response: {result}"
+            )
+            return 0.0
+        lamports = raw.get("value", 0)
         return lamports / 1_000_000_000
     except Exception as e:
-        logger.error(f"getBalance failed for {wallet_pubkey[:8]}: {e}")
+        logger.error(f"getBalance exception for {wallet_pubkey[:8]}…: {e}")
         return 0.0
 
 
@@ -267,6 +282,53 @@ def send_telegram(message: str) -> bool:
         return False
 
 
+# --- Startup diagnostics ----------------------------------------------
+
+def startup_checks(rpc_url: str, wallet_pubkey: str) -> None:
+    """
+    Run at bot start.  Verifies wallet balance is readable and Telegram
+    is reachable.  All findings logged at ERROR level so they are
+    impossible to miss in pm2 logs.
+    """
+    # 1. Wallet balance --------------------------------------------------
+    logger.info(f"Startup balance check — wallet: {wallet_pubkey[:8]}…")
+    bal = get_sol_balance(rpc_url, wallet_pubkey)
+    if bal > 0:
+        logger.info(f"Wallet balance: {bal:.4f} SOL ✓")
+    else:
+        logger.error(
+            f"Wallet balance read as 0.0 SOL — either wallet is empty, "
+            f"WALLET_PUBLIC_KEY is wrong, or RPC returned an error above"
+        )
+
+    # 2. Telegram token format ------------------------------------------
+    token   = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
+    token_valid = bool(re.match(r"^\d{8,12}:[A-Za-z0-9_-]{35,}$", token))
+    logger.info(
+        f"Telegram token: first10={token[:10]!r}  len={len(token)}  "
+        f"format_valid={token_valid}  chat_id={chat_id!r}"
+    )
+    if not token_valid:
+        logger.error(
+            "TELEGRAM_BOT_TOKEN format looks wrong — expected '123456789:ABCdef…' "
+            f"(got len={len(token)}, first10={token[:10]!r}). "
+            "Check VPS .env for extra spaces, newlines, or truncation."
+        )
+
+    # 3. Live Telegram test message --------------------------------------
+    logger.info("Sending startup Telegram test message…")
+    ok = send_telegram("🤖 <b>APEX Whale Sniper</b> — startup OK\nBalance: "
+                       f"{bal:.4f} SOL | DRY_RUN={DRY_RUN}")
+    if ok:
+        logger.info("Startup Telegram test: PASSED ✓")
+    else:
+        logger.error(
+            "Startup Telegram test: FAILED — check errors above. "
+            f"URL being called: https://api.telegram.org/bot{token[:10]}…/sendMessage"
+        )
+
+
 # --- Main loop --------------------------------------------------------
 
 async def poll_whale(
@@ -394,23 +456,30 @@ async def poll_whale(
 
 
 async def run():
-    rpc_url    = os.getenv("SOLANA_RPC", "")
-    wallet_key = os.getenv("WALLET_PRIVATE_KEY", "")
+    rpc_url       = os.getenv("SOLANA_RPC", "")
+    wallet_pubkey = os.getenv("WALLET_PUBLIC_KEY", "")   # base58 address — for balance checks + Jupiter
+    wallet_key    = os.getenv("WALLET_PRIVATE_KEY", "")  # byte array    — for tx signing (live mode only)
 
     if not rpc_url:
         logger.error("SOLANA_RPC not set — exiting")
         return
+    if not wallet_pubkey:
+        logger.error(
+            "WALLET_PUBLIC_KEY not set in .env — balance guard will always read 0.0 SOL. "
+            "Add: WALLET_PUBLIC_KEY=<your base58 address>"
+        )
 
     logger.info(f"Whale Sniper starting — DRY_RUN={DRY_RUN}")
     logger.info(f"Tracking {len(WHALE_WALLETS)} whales: {', '.join(WHALE_WALLETS)}")
-    # At startup no 24 h activity is recorded — all whales are cold
     for wname in WHALE_WALLETS:
         logger.info(f"[{wname.upper()}] COLD WHALE ❄️ (no activity recorded yet)")
+
+    startup_checks(rpc_url, wallet_pubkey)
 
     async with aiohttp.ClientSession() as session:
         while True:
             tasks = [
-                poll_whale(session, name, wallet, rpc_url, wallet_key)
+                poll_whale(session, name, wallet, rpc_url, wallet_pubkey)
                 for name, wallet in WHALE_WALLETS.items()
             ]
             await asyncio.gather(*tasks, return_exceptions=True)
