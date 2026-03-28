@@ -30,7 +30,11 @@ WSOL_MINT        = "So11111111111111111111111111111111111111112"
 
 DRY_RUN          = os.getenv("DRY_RUN", "True").lower() == "true"
 BUY_AMOUNT_SOL   = float(os.getenv("BUY_AMOUNT_SOL", "0.1"))
-MAX_SLIPPAGE_BPS = int(os.getenv("MAX_SLIPPAGE_BPS", "1500"))
+MAX_SLIPPAGE_BPS      = int(os.getenv("MAX_SLIPPAGE_BPS", "1500"))
+PRIORITY_FEE_LAMPORTS = int(os.getenv("PRIORITY_FEE_LAMPORTS", "100000"))
+
+TX_CONFIRM_TIMEOUT_SEC = 30   # give up on confirmation after this many seconds
+TX_CONFIRM_POLL_SEC    = 2    # poll getSignatureStatuses every N seconds (max 15 polls)
 
 POLL_INTERVAL_SEC = 120  # 2-minute interval to reduce Helius credit usage
 LOW_BALANCE_SOL   = float(os.getenv("LOW_BALANCE_SOL", "0.05"))  # skip trade + alert if below
@@ -67,6 +71,10 @@ open_positions: dict[str, dict] = {}
 # Take-profit and time-stop closures do NOT blacklist — re-entry on winners allowed.
 _token_blacklist: dict[str, float] = {}
 BLACKLIST_MINUTES = 45          # minutes to ban a token after a trailing stop loss
+
+# Set once at startup in run() — lets confirm_transaction() reach the RPC
+# without threading rpc_url through every intermediate function signature.
+_rpc_url: str = ""
 
 # --- Helius rate tracker ----------------------------------------------
 
@@ -259,37 +267,108 @@ async def get_sell_quote(
     return None
 
 
+async def confirm_transaction(
+    session: aiohttp.ClientSession,
+    txid: str,
+) -> tuple[bool, str]:
+    """
+    Poll Solana's getSignatureStatuses until the transaction confirms, fails,
+    or TX_CONFIRM_TIMEOUT_SEC is reached.
+
+    Returns:
+      (True,  "confirmed in 4.2s")              — safe to open position
+      (False, "tx failed on-chain: {err}")       — tx landed but reverted
+      (False, "not confirmed within 30s")        — timeout / dropped
+    In DRY_RUN mode returns (True, "DRY_RUN skip") without any network call.
+    """
+    if DRY_RUN:
+        return True, "DRY_RUN skip"
+
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getSignatureStatuses",
+        "params": [[txid], {"searchTransactionHistory": True}],
+    }
+    start = time.time()
+    while True:
+        elapsed = time.time() - start
+        if elapsed >= TX_CONFIRM_TIMEOUT_SEC:
+            return False, f"not confirmed within {TX_CONFIRM_TIMEOUT_SEC}s"
+        try:
+            async with session.post(
+                _rpc_url,
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=8),
+            ) as resp:
+                resp.raise_for_status()
+                data  = await resp.json()
+                value = ((data.get("result") or {}).get("value") or [None])[0]
+                if value is None:
+                    # Tx not yet propagated — keep waiting
+                    await asyncio.sleep(TX_CONFIRM_POLL_SEC)
+                    continue
+                if value.get("err"):
+                    return False, f"tx failed on-chain: {value['err']}"
+                status = value.get("confirmationStatus", "")
+                if status in ("confirmed", "finalized"):
+                    return True, f"confirmed in {elapsed:.1f}s"
+                # "processed" — seen but not yet in a confirmed block
+        except Exception as e:
+            logger.warning(f"Confirmation poll error ({txid[:16]}…): {e}")
+        await asyncio.sleep(TX_CONFIRM_POLL_SEC)
+
+
 async def execute_swap(
     session: aiohttp.ClientSession,
     quote: dict,
     wallet_pubkey: str,
-) -> str | None:
+) -> tuple[str | None, str]:
+    """
+    Submit a Jupiter swap and wait for on-chain confirmation.
+    Returns (txid, message) on success, (None, reason) on any failure.
+    In DRY_RUN mode returns ("DRY_RUN_SIG", "DRY_RUN") immediately.
+    """
     if DRY_RUN:
         logger.info(
             f"[DRY RUN] Would swap {quote.get('inAmount')} lamports → "
             f"{quote.get('outAmount')} tokens ({quote.get('outputMint','?')[:8]})"
         )
-        return "DRY_RUN_SIG"
+        return "DRY_RUN_SIG", "DRY_RUN"
 
     payload = {
         "quoteResponse":             quote,
         "userPublicKey":             wallet_pubkey,
         "wrapAndUnwrapSol":          True,
         "dynamicComputeUnitLimit":   True,
-        "prioritizationFeeLamports": "auto",
+        "prioritizationFeeLamports": PRIORITY_FEE_LAMPORTS,   # was "auto"
     }
-    url = f"{JUPITER_API}/swap"
+    url  = f"{JUPITER_API}/swap"
+    txid = None
     for attempt in range(3):
         try:
             async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 resp.raise_for_status()
-                data = await resp.json()
-                return data.get("txid")
+                txid = (await resp.json()).get("txid")
+                break   # submission accepted — move to confirmation
         except Exception as e:
             logger.error(f"Jupiter swap attempt {attempt + 1}/3 failed: {e}")
             if attempt < 2:
                 await asyncio.sleep(2)
-    return None
+
+    if not txid:
+        return None, "Jupiter swap failed after 3 attempts"
+
+    logger.info(
+        f"TX submitted: {txid[:16]}… — waiting up to {TX_CONFIRM_TIMEOUT_SEC}s"
+    )
+    ok, reason = await confirm_transaction(session, txid)
+    if not ok:
+        logger.error(f"TX {txid[:16]}… confirmation failed: {reason}")
+        return None, reason
+
+    logger.info(f"TX {txid[:16]}… {reason}")
+    return txid, reason
 
 
 # --- Telegram ---------------------------------------------------------
@@ -385,11 +464,12 @@ async def check_and_maybe_exit(
             f"{current_sol:.4f} SOL ({exit_reason})"
         )
     else:
-        sell_sig = await execute_swap(session, sell_quote, wallet_pubkey)
+        sell_sig, sell_msg = await execute_swap(session, sell_quote, wallet_pubkey)
         if not sell_sig:
             logger.error(
-                f"[{token_mint[:8]}] Sell swap failed — keeping position open, "
-                f"will retry next cycle. Trigger was: {exit_reason}"
+                f"[{token_mint[:8]}] Sell swap failed ({sell_msg}) — "
+                f"keeping position open, will retry next cycle. "
+                f"Trigger was: {exit_reason}"
             )
             return  # don't clear position if live sell tx failed
 
@@ -593,7 +673,20 @@ async def poll_whale(
             )
             continue
 
-        swap_sig = await execute_swap(session, quote, wallet_pubkey)
+        swap_sig, swap_msg = await execute_swap(session, quote, wallet_pubkey)
+
+        if not swap_sig:
+            logger.error(
+                f"[{name}] Buy on {token_mint[:8]} did not confirm — "
+                f"{swap_msg} — position NOT opened"
+            )
+            send_telegram(
+                f"⚠️ <b>TX FAILED</b> — [{name.upper()}] buy on "
+                f"<code>{token_mint[:8]}</code> did not confirm\n"
+                f"Reason: {swap_msg}\n"
+                f"Position NOT opened — no money spent"
+            )
+            continue
 
         # High conviction gets its own priority Telegram alert first
         if is_high_conviction:
@@ -663,9 +756,11 @@ async def whale_poll_loop(
 
 
 async def run():
+    global _rpc_url
     rpc_url       = os.getenv("SOLANA_RPC", "")
     wallet_pubkey = os.getenv("WALLET_PUBLIC_KEY", "")   # base58 address — for balance checks + Jupiter
     wallet_key    = os.getenv("WALLET_PRIVATE_KEY", "")  # byte array    — for tx signing (live mode only)
+    _rpc_url      = rpc_url                              # module-level — used by confirm_transaction()
 
     if not rpc_url:
         logger.error("SOLANA_RPC not set — exiting")
