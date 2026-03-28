@@ -56,12 +56,17 @@ HOT_THRESHOLD         = 3       # buys in 24 h to be classified HOT
 
 # --- Sell / exit parameters -------------------------------------------
 TAKE_PROFIT_PCT    = 50.0   # exit if SOL value up ≥ 50 % from entry
-TRAILING_STOP_PCT  = 15.0   # exit if SOL value drops ≥ 15 % from peak
+TRAILING_STOP_PCT  = 10.0   # exit if SOL value drops ≥ 10 % from peak
 TIME_STOP_MIN      = 30     # force-close after this many minutes
-POSITION_CHECK_SEC = 30     # how often the sell monitor loop runs
+POSITION_CHECK_SEC = 10     # how often the sell monitor loop runs
 
 # Open positions: token_mint → position dict (populated after every buy)
 open_positions: dict[str, dict] = {}
+
+# Blacklist: token_mint → expiry timestamp. Only set on TRAILING STOP exits.
+# Take-profit and time-stop closures do NOT blacklist — re-entry on winners allowed.
+_token_blacklist: dict[str, float] = {}
+BLACKLIST_MINUTES = 45          # minutes to ban a token after a trailing stop loss
 
 # --- Helius rate tracker ----------------------------------------------
 
@@ -394,6 +399,14 @@ async def check_and_maybe_exit(
     # Remove from open_positions *before* logging so monitor doesn't re-enter
     del open_positions[token_mint]
 
+    # Blacklist on trailing stop ONLY — take profit and time stop allow re-entry
+    if exit_reason.startswith("TRAILING STOP"):
+        _token_blacklist[token_mint] = time.time() + BLACKLIST_MINUTES * 60
+        logger.info(
+            f"[{token_mint[:8]}] Blacklisted for {BLACKLIST_MINUTES}min "
+            f"(trailing stop loss — will not re-enter until cooldown expires)"
+        )
+
     logger.info(
         f"[{token_mint[:8]}] {exit_reason} | "
         f"Entry: {entry_sol:.4f} SOL | Exit: {current_sol:.4f} SOL | "
@@ -499,6 +512,28 @@ async def poll_whale(
             continue
 
         logger.info(f"[{name}] BUY signal → {token_mint}")
+
+        # Guard 1 — skip if we already hold this token (prevents same-cycle duplicates)
+        if token_mint in open_positions:
+            logger.info(
+                f"[{name}] SKIP — {token_mint[:8]} already in open_positions "
+                f"(duplicate buy signal ignored)"
+            )
+            continue
+
+        # Guard 2 — skip if token is blacklisted after a trailing stop loss
+        now_ts = time.time()
+        expired_mints = [m for m, exp in _token_blacklist.items() if now_ts >= exp]
+        for m in expired_mints:
+            del _token_blacklist[m]
+            logger.info(f"Blacklist expired — {m[:8]} re-enabled")
+        if token_mint in _token_blacklist:
+            remaining_min = (_token_blacklist[token_mint] - now_ts) / 60
+            logger.info(
+                f"[{name}] SKIP — {token_mint[:8]} blacklisted, "
+                f"{remaining_min:.0f}min remaining after trailing stop"
+            )
+            continue
 
         # --- Conviction + activity tracking ----------------------------
         now = time.time()
@@ -648,6 +683,16 @@ async def run():
 
     startup_checks(rpc_url, wallet_pubkey)
     logger.info(f"Position monitor: {len(open_positions)} open position(s) at startup")
+    now_ts = time.time()
+    active_bl = {m: exp for m, exp in _token_blacklist.items() if exp > now_ts}
+    if not active_bl:
+        logger.info("Blacklist: empty")
+    else:
+        longest_min = (max(active_bl.values()) - now_ts) / 60
+        logger.info(
+            f"Blacklist: {len(active_bl)} token(s) active, "
+            f"longest expiry {longest_min:.0f}min from now"
+        )
 
     async with aiohttp.ClientSession() as session:
         await asyncio.gather(
