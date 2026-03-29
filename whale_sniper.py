@@ -64,6 +64,19 @@ TRAILING_STOP_PCT  = 10.0   # exit if SOL value drops ≥ 10 % from peak
 TIME_STOP_MIN      = 30     # force-close after this many minutes
 POSITION_CHECK_SEC = 10     # how often the sell monitor loop runs
 
+# --- Entry confirmation parameters ------------------------------------
+ENTRY_DELAY_SEC  = 60     # wait before executing entry
+ENTRY_DUMP_PCT   = 3.0    # skip if price drops >3% in the delay window
+
+# --- Emergency exit parameters ----------------------------------------
+EMERGENCY_DUMP_PCT        = 5.0  # emergency exit if down >5% right after buy
+EMERGENCY_CHECK_DELAY_SEC = 5    # seconds after buy before emergency check runs
+
+# --- DexScreener quality filter ---------------------------------------
+DEXSCREENER_API       = "https://api.dexscreener.com/tokens/v1/solana"
+MIN_DEX_LIQUIDITY_USD = 20_000
+MIN_DEX_5M_VOLUME_USD = 10_000
+
 # Open positions: token_mint → position dict (populated after every buy)
 open_positions: dict[str, dict] = {}
 
@@ -75,6 +88,17 @@ BLACKLIST_MINUTES = 45          # minutes to ban a token after a trailing stop l
 # Set once at startup in run() — lets confirm_transaction() reach the RPC
 # without threading rpc_url through every intermediate function signature.
 _rpc_url: str = ""
+
+# --- Daily trade statistics (reset at midnight UTC) -------------------
+_stats: dict = {
+    "signals_detected":       0,   # every whale buy signal seen
+    "cancelled_dexscreener":  0,   # filtered by liquidity / volume check
+    "cancelled_entry_delay":  0,   # filtered by 60s price-dump test
+    "trades_executed":        0,   # buys that confirmed on-chain
+    "wins":                   0,   # closed positions with PnL >= 0
+    "losses":                 0,   # closed positions with PnL < 0
+    "net_pnl_sol":            0.0, # running sum of (exit_sol - entry_sol)
+}
 
 # --- Helius rate tracker ----------------------------------------------
 
@@ -166,6 +190,42 @@ def get_sol_balance(rpc_url: str, wallet_pubkey: str) -> float:
     except Exception as e:
         logger.error(f"getBalance exception for {wallet_pubkey[:8]}…: {e}")
         return 0.0
+
+
+# --- DexScreener quality check ----------------------------------------
+
+async def fetch_dexscreener(
+    session: aiohttp.ClientSession,
+    token_mint: str,
+) -> dict | None:
+    """
+    Fetch the highest-liquidity Solana pair for token_mint from DexScreener.
+    Returns None on any error — callers must fail-open (proceed with trade).
+    """
+    url = f"{DEXSCREENER_API}/{token_mint}"
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+            resp.raise_for_status()
+            data  = await resp.json()
+            pairs = data.get("pairs") or []
+            if not pairs:
+                return None
+            # Pick the pair with the highest USD liquidity
+            return max(pairs, key=lambda p: (p.get("liquidity") or {}).get("usd", 0) or 0)
+    except Exception as e:
+        logger.warning(f"DexScreener fetch failed for {token_mint[:8]}: {e}")
+        return None
+
+
+def passes_dex_quality(pair_data: dict) -> tuple[bool, str]:
+    """Return (True, summary) if token meets minimum quality thresholds."""
+    liq = (pair_data.get("liquidity") or {}).get("usd", 0) or 0
+    v5m = (pair_data.get("volume")    or {}).get("m5",  0) or 0
+    if liq < MIN_DEX_LIQUIDITY_USD:
+        return False, f"liquidity ${liq:,.0f} below ${MIN_DEX_LIQUIDITY_USD:,}"
+    if v5m < MIN_DEX_5M_VOLUME_USD:
+        return False, f"5m vol ${v5m:,.0f} below ${MIN_DEX_5M_VOLUME_USD:,}"
+    return True, f"liq=${liq:,.0f} 5m_vol=${v5m:,.0f}"
 
 
 # --- Trade detection --------------------------------------------------
@@ -487,6 +547,13 @@ async def check_and_maybe_exit(
             f"(trailing stop loss — will not re-enter until cooldown expires)"
         )
 
+    # Update daily stats
+    if pnl_pct >= 0:
+        _stats["wins"] += 1
+    else:
+        _stats["losses"] += 1
+    _stats["net_pnl_sol"] = round(_stats["net_pnl_sol"] + (current_sol - entry_sol), 6)
+
     logger.info(
         f"[{token_mint[:8]}] {exit_reason} | "
         f"Entry: {entry_sol:.4f} SOL | Exit: {current_sol:.4f} SOL | "
@@ -499,6 +566,125 @@ async def check_and_maybe_exit(
         f"PnL: {pnl_sign}{pnl_pct:.1f}%\n"
         f"Sig: <code>{sell_sig}</code>"
     )
+
+
+# --- Emergency dump exit ----------------------------------------------
+
+async def emergency_dump_check(
+    session: aiohttp.ClientSession,
+    token_mint: str,
+    wallet_pubkey: str,
+) -> None:
+    """
+    Fires EMERGENCY_CHECK_DELAY_SEC after position opens (via asyncio.create_task).
+    If price is already down >EMERGENCY_DUMP_PCT from entry, sells immediately
+    and blacklists the token.  Never blocks poll_whale().
+    """
+    await asyncio.sleep(EMERGENCY_CHECK_DELAY_SEC)
+    pos = open_positions.get(token_mint)
+    if pos is None:
+        return  # already closed by monitor loop — nothing to do
+
+    sell_quote = await get_sell_quote(session, token_mint, pos["amount_tokens"])
+    if sell_quote is None:
+        logger.warning(
+            f"[{token_mint[:8]}] emergency check: sell quote failed "
+            f"— normal monitor will handle"
+        )
+        return
+
+    current_sol = int(sell_quote.get("outAmount", 0)) / 1_000_000_000
+    entry_sol   = pos["entry_sol"]
+    pnl_pct     = (current_sol / entry_sol - 1) * 100 if entry_sol > 0 else 0.0
+
+    if pnl_pct > -EMERGENCY_DUMP_PCT:
+        logger.debug(f"[{token_mint[:8]}] emergency check OK — pnl={pnl_pct:+.1f}%")
+        return
+
+    logger.info(
+        f"[{token_mint[:8]}] IMMEDIATE DUMP DETECTED — "
+        f"emergency exit (pnl={pnl_pct:.1f}%)"
+    )
+
+    if DRY_RUN:
+        sell_sig = "DRY_RUN_SELL_SIG"
+        logger.info(
+            f"[DRY RUN] Would emergency-sell {pos['amount_tokens']:,} tokens "
+            f"→ {current_sol:.4f} SOL"
+        )
+    else:
+        sell_sig, sell_msg = await execute_swap(session, sell_quote, wallet_pubkey)
+        if not sell_sig:
+            logger.error(
+                f"[{token_mint[:8]}] Emergency sell failed ({sell_msg}) "
+                f"— normal monitor will handle"
+            )
+            return
+
+    del open_positions[token_mint]
+    _token_blacklist[token_mint] = time.time() + BLACKLIST_MINUTES * 60
+    logger.info(f"[{token_mint[:8]}] Blacklisted {BLACKLIST_MINUTES}min after emergency exit")
+
+    _stats["losses"]      += 1
+    _stats["net_pnl_sol"]  = round(_stats["net_pnl_sol"] + (current_sol - entry_sol), 6)
+
+    send_telegram(
+        f"🛑 <b>EMERGENCY EXIT [{token_mint[:8]}]</b>\n"
+        f"Immediate dump — down {abs(pnl_pct):.1f}% in {EMERGENCY_CHECK_DELAY_SEC}s\n"
+        f"Entry: {entry_sol:.4f} SOL | Exit: {current_sol:.4f} SOL\n"
+        f"Sig: <code>{sell_sig}</code>"
+    )
+
+
+# --- Daily summary ----------------------------------------------------
+
+def _send_daily_summary() -> None:
+    """Format and send the midnight UTC daily stats summary."""
+    total    = _stats["trades_executed"]
+    wins     = _stats["wins"]
+    losses   = _stats["losses"]
+    net      = _stats["net_pnl_sol"]
+    pnl_sign = "+" if net >= 0 else ""
+    win_rate = f"{wins / total * 100:.0f}%" if total > 0 else "n/a"
+    date_str = time.strftime("%Y-%m-%d", time.gmtime())
+    msg = (
+        f"📊 <b>APEX Daily Summary</b> ({date_str})\n\n"
+        f"Signals detected:         {_stats['signals_detected']}\n"
+        f"Cancelled (DexScreener):  {_stats['cancelled_dexscreener']}\n"
+        f"Cancelled (60s dump):     {_stats['cancelled_entry_delay']}\n"
+        f"Trades executed:          {total}\n"
+        f"Wins / Losses:            {wins} / {losses}  ({win_rate})\n"
+        f"Net PnL:                  {pnl_sign}{net:.4f} SOL"
+    )
+    logger.info(
+        f"DAILY SUMMARY | signals={_stats['signals_detected']} "
+        f"cancelled_dex={_stats['cancelled_dexscreener']} "
+        f"cancelled_delay={_stats['cancelled_entry_delay']} "
+        f"trades={total} W/L={wins}/{losses} pnl={pnl_sign}{net:.4f} SOL"
+    )
+    send_telegram(msg)
+
+
+def _reset_stats() -> None:
+    """Zero all daily counters — called immediately after midnight summary."""
+    for key in ("signals_detected", "cancelled_dexscreener", "cancelled_entry_delay",
+                "trades_executed", "wins", "losses"):
+        _stats[key] = 0
+    _stats["net_pnl_sol"] = 0.0
+
+
+async def midnight_summary_loop() -> None:
+    """Sleep until midnight UTC, send daily summary, reset stats, repeat."""
+    while True:
+        t = time.gmtime()
+        secs = (23 - t.tm_hour) * 3600 + (59 - t.tm_min) * 60 + (60 - t.tm_sec)
+        logger.info(
+            f"Daily summary scheduled in "
+            f"{secs // 3600}h {(secs % 3600) // 60}m"
+        )
+        await asyncio.sleep(secs)
+        _send_daily_summary()
+        _reset_stats()
 
 
 # --- Startup diagnostics ----------------------------------------------
@@ -592,6 +778,7 @@ async def poll_whale(
             continue
 
         logger.info(f"[{name}] BUY signal → {token_mint}")
+        _stats["signals_detected"] += 1
 
         # Guard 1 — skip if we already hold this token (prevents same-cycle duplicates)
         if token_mint in open_positions:
@@ -639,16 +826,6 @@ async def poll_whale(
         if buys_24h >= HOT_THRESHOLD:
             logger.info(f"[{name.upper()}] HOT WHALE 🔥 ({buys_24h} buys in 24h)")
 
-        # Position sizing
-        if is_high_conviction:
-            buy_sol = round(BUY_AMOUNT_SOL * CONVICTION_MULTIPLIER, 4)
-            logger.info(
-                f"[{name.upper()}] HIGH CONVICTION — double buy detected on {token_mint[:8]}"
-            )
-        else:
-            buy_sol = BUY_AMOUNT_SOL
-        # ---------------------------------------------------------------
-
         # --- Pre-trade SOL balance guard --------------------------------
         sol_balance = get_sol_balance(rpc_url, wallet_pubkey)
         if sol_balance < LOW_BALANCE_SOL:
@@ -663,15 +840,89 @@ async def poll_whale(
         logger.info(f"[{name}] Balance OK: {sol_balance:.4f} SOL (min={LOW_BALANCE_SOL} SOL)")
         # ----------------------------------------------------------------
 
-        amount_lamports = int(buy_sol * 1_000_000_000)
-        quote = await get_jupiter_quote(session, token_mint, amount_lamports)
-        if not quote:
-            logger.error(
-                f"[{name}] SKIP — Jupiter quote failed after 3 attempts "
-                f"for {token_mint[:8]} (token may lack Jupiter liquidity or "
-                f"slippage tolerance too tight)"
+        # --- DexScreener quality check — Fix 2 -------------------------
+        dex_pair = await fetch_dexscreener(session, token_mint)
+        if dex_pair is None:
+            logger.warning(
+                f"[{name}] DexScreener unavailable for {token_mint[:8]} "
+                f"— proceeding (fail-open)"
             )
+        else:
+            dex_ok, dex_reason = passes_dex_quality(dex_pair)
+            if not dex_ok:
+                logger.info(
+                    f"[{name}] SKIP — DexScreener quality fail: {dex_reason} "
+                    f"({token_mint[:8]})"
+                )
+                _stats["cancelled_dexscreener"] += 1
+                continue
+            logger.info(f"[{name}] DexScreener OK — {dex_reason}")
+        # ----------------------------------------------------------------
+
+        # --- 60-second entry delay with price-direction check — Fix 1 --
+        send_telegram(
+            f"⏳ <b>[{name.upper()}]</b> signal detected on "
+            f"<code>{token_mint[:8]}</code>\n"
+            f"Waiting {ENTRY_DELAY_SEC}s to confirm price direction…"
+        )
+
+        probe_lamports = int(BUY_AMOUNT_SOL * 1_000_000_000)
+        quote_t0 = await get_jupiter_quote(session, token_mint, probe_lamports)
+        if not quote_t0:
+            logger.error(f"[{name}] SKIP — T=0 quote failed for {token_mint[:8]}")
             continue
+        price_t0 = int(quote_t0.get("outAmount", 0))
+
+        # Sleep releases the event loop — position_monitor_loop continues normally.
+        # Note: asyncio.gather waits for all whale coroutines, so the next poll
+        # cycle is delayed ~60s when an active signal is in progress.
+        await asyncio.sleep(ENTRY_DELAY_SEC)
+
+        quote_t60 = await get_jupiter_quote(session, token_mint, probe_lamports)
+        if not quote_t60:
+            logger.error(f"[{name}] SKIP — T=60 quote failed for {token_mint[:8]}")
+            continue
+        price_t60 = int(quote_t60.get("outAmount", 0))
+
+        # Higher outAmount at T=60 = same SOL buys more tokens = token is cheaper = dumped
+        dump_pct = (price_t60 / price_t0 - 1) * 100 if price_t0 > 0 else 0.0
+
+        if dump_pct > ENTRY_DUMP_PCT:
+            logger.info(
+                f"[{name}] Entry cancelled — {token_mint[:8]} dropped "
+                f"{dump_pct:.1f}% in {ENTRY_DELAY_SEC}s window"
+            )
+            _stats["cancelled_entry_delay"] += 1
+            continue
+
+        logger.info(
+            f"[{name}] Entry confirmed — {token_mint[:8]} price held/rose "
+            f"in {ENTRY_DELAY_SEC}s window (dump_pct={dump_pct:.1f}%)"
+        )
+        # ----------------------------------------------------------------
+
+        # --- Position sizing — conviction multiplier only after quality gates — Fix 3
+        if is_high_conviction:
+            buy_sol = round(BUY_AMOUNT_SOL * CONVICTION_MULTIPLIER, 4)
+            logger.info(
+                f"[{name.upper()}] HIGH CONVICTION sizing confirmed — "
+                f"{buy_sol} SOL (all quality gates passed)"
+            )
+        else:
+            buy_sol = BUY_AMOUNT_SOL
+        # ----------------------------------------------------------------
+
+        # Reuse T=60 quote for normal size; re-fetch only for conviction size
+        if buy_sol == BUY_AMOUNT_SOL:
+            quote = quote_t60
+        else:
+            amount_lamports = int(buy_sol * 1_000_000_000)
+            quote = await get_jupiter_quote(session, token_mint, amount_lamports)
+            if not quote:
+                logger.error(
+                    f"[{name}] SKIP — conviction-sized quote failed for {token_mint[:8]}"
+                )
+                continue
 
         swap_sig, swap_msg = await execute_swap(session, quote, wallet_pubkey)
 
@@ -724,6 +975,9 @@ async def poll_whale(
                 f"[{token_mint[:8]}] Position opened — "
                 f"{token_units:,} tokens | entry {entry_sol:.4f} SOL"
             )
+            _stats["trades_executed"] += 1
+            # Emergency dump check fires 5s after buy — non-blocking — Fix 4
+            asyncio.create_task(emergency_dump_check(session, token_mint, wallet_pubkey))
         # ---------------------------------------------------------------
 
 
@@ -793,6 +1047,7 @@ async def run():
         await asyncio.gather(
             whale_poll_loop(session, rpc_url, wallet_pubkey),
             position_monitor_loop(session, wallet_pubkey),
+            midnight_summary_loop(),
         )
 
 
