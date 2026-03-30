@@ -1,2 +1,8 @@
 .env
-.env
+bot_env/
+venv/
+__pycache__/
+*.pyc
+*.log
+.DS_Store
+chromadb/
