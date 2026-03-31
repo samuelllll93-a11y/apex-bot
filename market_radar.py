@@ -43,6 +43,9 @@ PEAK_START_UTC        = 12
 PEAK_END_UTC          = 22
 MAX_AGE_MINUTES       = 120
 MIN_VOLUME_5M_USD     = 500
+# Helius getTokenLargestAccounts returns at most 20 accounts, so
+# holder_count == 20 means "data capped / unavailable", not a real signal.
+HOLDER_NULL_VALUE     = 20
 
 
 def _min_liquidity_usd() -> int:
@@ -168,12 +171,19 @@ def get_holder_count(token_address: str, rpc_url: str) -> int | None:
 
 def passes_holder_filter(holder_count: int | None, max_holders: int = 500) -> bool:
     """
-    Bug fix #3: fail-open — if holder_count is None (unknown), allow the trade.
-    Original fail-closed:  if holder_count > 0 and holder_count < max_holders
-    Fixed fail-open:       unknown count is treated as passing
+    Fail-open holder filter.
+    - None:              data unavailable from RPC — allow trade (fail-open)
+    - HOLDER_NULL_VALUE: Helius API cap hit (returns max 20 accounts) —
+                         treat as unavailable, bypass concentration check
+    - otherwise:         block if holder_count >= max_holders
     """
     if holder_count is None:
         logger.warning("holder count unknown — failing open (allowing trade)")
+        return True
+    if holder_count == HOLDER_NULL_VALUE:
+        logger.info("[HOLDER] Data unavailable (API cap) — skipping concentration check")
+        return True
+    if holder_count <= 0:
         return True
     return holder_count < max_holders
 
@@ -446,7 +456,10 @@ async def run():
                         # ── 4. Expensive Helius RPC — holder count ─────────────────────
                         holder_count = get_holder_count(token_address, rpc_url) if rpc_url else None
 
-                        if not passes_holder_filter(holder_count):
+                        if holder_count == HOLDER_NULL_VALUE:
+                            logger.info(f"[HOLDER] Data unavailable for {symbol} — skipping concentration check")
+                            holder_count = None  # Claude will see "unknown" not "20"
+                        elif not passes_holder_filter(holder_count):
                             logger.info(f"SKIP | {symbol} | SKIP_REASON:holders | too many holders ({holder_count})")
                             continue
 
