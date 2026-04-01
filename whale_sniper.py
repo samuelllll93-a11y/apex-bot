@@ -100,6 +100,15 @@ _stats: dict = {
     "net_pnl_sol":            0.0, # running sum of (exit_sol - entry_sol)
 }
 
+# --- Per-trade log (for /summary command) -----------------------------
+_trade_log: list[dict] = []   # [{ts: float, pnl_sol: float}, ...]
+_SUMMARY_WINDOW_SEC = 43_200  # 12 hours
+
+
+def _record_trade(pnl_sol: float) -> None:
+    """Append a closed trade to the rolling trade log."""
+    _trade_log.append({"ts": time.time(), "pnl_sol": round(pnl_sol, 6)})
+
 # --- Helius rate tracker ----------------------------------------------
 
 HELIUS_DAILY_WARN_LIMIT = 26_000   # ~800k credits/month ÷ 30 days
@@ -553,6 +562,7 @@ async def check_and_maybe_exit(
     else:
         _stats["losses"] += 1
     _stats["net_pnl_sol"] = round(_stats["net_pnl_sol"] + (current_sol - entry_sol), 6)
+    _record_trade(current_sol - entry_sol)
 
     logger.info(
         f"[{token_mint[:8]}] {exit_reason} | "
@@ -627,6 +637,7 @@ async def emergency_dump_check(
 
     _stats["losses"]      += 1
     _stats["net_pnl_sol"]  = round(_stats["net_pnl_sol"] + (current_sol - entry_sol), 6)
+    _record_trade(current_sol - entry_sol)
 
     send_telegram(
         f"🛑 <b>EMERGENCY EXIT [{token_mint[:8]}]</b>\n"
@@ -634,6 +645,127 @@ async def emergency_dump_check(
         f"Entry: {entry_sol:.4f} SOL | Exit: {current_sol:.4f} SOL\n"
         f"Sig: <code>{sell_sig}</code>"
     )
+
+
+# --- /summary command -------------------------------------------------
+
+def _summary_message() -> str:
+    """Build a 12-hour trade summary string for the /summary Telegram command."""
+    now    = time.time()
+    cutoff = now - _SUMMARY_WINDOW_SEC
+    window = [t for t in _trade_log if t["ts"] >= cutoff]
+
+    start_str = time.strftime("%H:%M UTC", time.gmtime(cutoff))
+    end_str   = time.strftime("%H:%M UTC", time.gmtime(now))
+
+    if not window:
+        return (
+            "📊 <b>12-Hour Trade Summary</b>\n"
+            "━━━━━━━━━━━━━━━\n"
+            f"🕐 Period: {start_str} → {end_str}\n"
+            "No trades executed in the last 12 hours."
+        )
+
+    total  = len(window)
+    wins   = [t for t in window if t["pnl_sol"] >= 0]
+    losses = [t for t in window if t["pnl_sol"] <  0]
+    n_wins = len(wins)
+    n_loss = len(losses)
+
+    win_rate  = n_wins / total * 100
+    loss_rate = n_loss / total * 100
+    total_pnl = sum(t["pnl_sol"] for t in window)
+    avg_win   = sum(t["pnl_sol"] for t in wins)   / n_wins if n_wins else 0.0
+    avg_loss  = sum(t["pnl_sol"] for t in losses) / n_loss if n_loss else 0.0
+
+    pnl_sign  = "+" if total_pnl >= 0 else ""
+    win_sign  = "+" if avg_win   >= 0 else ""
+    loss_sign = "+" if avg_loss  >= 0 else ""
+
+    return (
+        "📊 <b>12-Hour Trade Summary</b>\n"
+        "━━━━━━━━━━━━━━━\n"
+        f"🕐 Period: {start_str} → {end_str}\n"
+        f"📈 Total Trades: {total}\n"
+        f"✅ Wins: {n_wins} ({win_rate:.1f}%)\n"
+        f"❌ Losses: {n_loss} ({loss_rate:.1f}%)\n"
+        f"💰 Total PnL: {pnl_sign}{total_pnl:.4f} SOL\n"
+        f"📉 Avg Win: {win_sign}{avg_win:.4f} SOL\n"
+        f"📈 Avg Loss: {loss_sign}{avg_loss:.4f} SOL\n"
+        "━━━━━━━━━━━━━━━"
+    )
+
+
+def _register_commands() -> None:
+    """Register /summary in Telegram's bot command menu."""
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    if not token:
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{token}/setMyCommands",
+            json={"commands": [{"command": "summary", "description": "12-hour trade summary"}]},
+            timeout=5,
+        )
+        logger.info("Telegram /summary command registered")
+    except Exception as e:
+        logger.warning(f"setMyCommands failed: {e}")
+
+
+async def telegram_command_loop() -> None:
+    """Long-poll Telegram getUpdates and respond to /summary commands.
+
+    Uses its own aiohttp session so the 30-second long-poll never competes
+    with the shared session used by the whale poller and position monitor.
+    """
+    token   = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
+    if not token or not chat_id:
+        logger.warning("telegram_command_loop: credentials missing — /summary won't respond")
+        return
+
+    base_url       = f"https://api.telegram.org/bot{token}"
+    last_update_id = 0
+
+    async with aiohttp.ClientSession() as tg_session:
+        while True:
+            try:
+                params = {"timeout": 30, "offset": last_update_id + 1}
+                async with tg_session.get(
+                    f"{base_url}/getUpdates",
+                    params=params,
+                    timeout=aiohttp.ClientTimeout(total=40),
+                ) as resp:
+                    resp.raise_for_status()
+                    data = await resp.json()
+            except Exception as e:
+                logger.warning(f"getUpdates failed: {e}")
+                await asyncio.sleep(5)
+                continue
+
+            if not data.get("ok"):
+                logger.error(f"Telegram getUpdates error: {data.get('description', data)}")
+                await asyncio.sleep(5)
+                continue
+
+            for update in data.get("result", []):
+                last_update_id = max(last_update_id, update.get("update_id", 0))
+                msg  = update.get("message") or {}
+                text = (msg.get("text") or "").strip()
+                cid  = str(msg.get("chat", {}).get("id", ""))
+
+                if text.startswith("/summary") and cid == chat_id:
+                    reply = _summary_message()
+                    try:
+                        async with tg_session.post(
+                            f"{base_url}/sendMessage",
+                            json={"chat_id": chat_id, "text": reply, "parse_mode": "HTML"},
+                            timeout=aiohttp.ClientTimeout(total=10),
+                        ) as r:
+                            r.raise_for_status()
+                            logger.info("/summary command handled")
+                    except Exception as e:
+                        logger.warning(f"/summary reply failed: {e}")
 
 
 # --- Daily summary ----------------------------------------------------
@@ -1030,6 +1162,7 @@ async def run():
     for wname in WHALE_WALLETS:
         logger.info(f"[{wname.upper()}] COLD WHALE ❄️ (no activity recorded yet)")
 
+    _register_commands()
     startup_checks(rpc_url, wallet_pubkey)
     logger.info(f"Position monitor: {len(open_positions)} open position(s) at startup")
     now_ts = time.time()
@@ -1048,6 +1181,7 @@ async def run():
             whale_poll_loop(session, rpc_url, wallet_pubkey),
             position_monitor_loop(session, wallet_pubkey),
             midnight_summary_loop(),
+            telegram_command_loop(),
         )
 
 
