@@ -718,6 +718,8 @@ async def telegram_command_loop() -> None:
     Uses its own aiohttp session so the 30-second long-poll never competes
     with the shared session used by the whale poller and position monitor.
     """
+    logger.info("Telegram command loop started — listening for /summary")
+
     token   = os.getenv("TELEGRAM_BOT_TOKEN", "")
     chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
     if not token or not chat_id:
