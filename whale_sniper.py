@@ -1429,6 +1429,22 @@ async def poll_whale(
         )
         # ----------------------------------------------------------------
 
+        # --- Claude confidence scoring ---------------------------------
+        claude_score = await get_claude_score(
+            token_mint,
+            dex_pair,
+            prebond_pct,   # None if not a pump.fun token or if graduated
+            f"whale={name} signal, conviction={'high' if is_high_conviction else 'normal'}",
+        )
+        tier = get_exit_tier(claude_score)
+        logger.info(
+            f"[{name}] Claude score: {claude_score}/100 | "
+            f"Tier: min_target={tier['min_target_pct']}% "
+            f"trail={tier['trail_pct']}% "
+            f"time={tier['time_stop_min']}m"
+        )
+        # ----------------------------------------------------------------
+
         # --- Position sizing — prebond override takes priority, then conviction ---
         if prebond_buy_sol is not None:
             # Prebond entry: fixed 2% of balance (no conviction multiplier on prebond)
@@ -1502,7 +1518,7 @@ async def poll_whale(
                 "amount_tokens": token_units,
                 "whale":         name,
                 "buy_sol":       buy_sol,
-                "claude_score":  70,        # placeholder — real value wired in Task 5
+                "claude_score":  claude_score,
                 "min_target_hit": False,
                 "source":        "whale",
             }
