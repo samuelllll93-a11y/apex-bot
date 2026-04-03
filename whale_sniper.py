@@ -44,7 +44,7 @@ WHALE_WALLETS: dict[str, str] = {
     "peace":  "7b88jCzsirGfLmFMyr7BXbCaDGTtuq8oDTWusqWvLv38",
     "crispy": "EdbNfzVJjVZFsz1awBezeJpBaySLsckoZyPyaucy3g2R",
     "mannos": "CAmNcBJ82xr1tzXrwZ6tZKwEFs26TG8kT6dJeR1bxjW9",
-    "early":  "Bv2BAw5UmKxv5SBMWYKqpsh6eXKNGM2RKxJGpGPk5vmb",
+    # "early":  "Bv2BAw5UmKxv5SBMWYKqpsh6eXKNGM2RKxJGpGPk5vmb",  # disabled 2026-03-31
 }
 
 # Track the last seen signature per wallet to detect new txns
@@ -59,9 +59,9 @@ ACTIVITY_WINDOW_SEC   = 86_400  # 24 h    — HOT / COLD scoring window
 HOT_THRESHOLD         = 3       # buys in 24 h to be classified HOT
 
 # --- Sell / exit parameters -------------------------------------------
-TAKE_PROFIT_PCT    = 50.0   # exit if SOL value up ≥ 50 % from entry
-TRAILING_STOP_PCT  = 10.0   # exit if SOL value drops ≥ 10 % from peak
-TIME_STOP_MIN      = 30     # force-close after this many minutes
+TAKE_PROFIT_PCT    = float(os.getenv("TAKE_PROFIT_PCT", "0.50")) * 100  # .env decimal → % (e.g. 0.38 = 38%)
+TRAILING_STOP_PCT  = float(os.getenv("TRAILING_STOP_PCT", "0.10")) * 100  # .env decimal → % (e.g. 0.13 = 13%)
+TIME_STOP_MIN      = int(os.getenv("TIME_STOP_MIN", "30"))  # minutes
 POSITION_CHECK_SEC = 10     # how often the sell monitor loop runs
 
 # --- Entry confirmation parameters ------------------------------------
