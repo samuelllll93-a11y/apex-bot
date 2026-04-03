@@ -346,6 +346,60 @@ async def get_claude_score(
         return 70
 
 
+# --- MANNOS tiered exit logic -----------------------------------------
+
+MANNOS_HARD_FLOOR_PCT = -20.0  # max loss before min target — protects against dumps
+
+def get_exit_tier(claude_score: int) -> dict:
+    """
+    Return exit parameters for a given Claude confidence score.
+    Tier 3 (85+): 400% min target, 30% trail, 90min  [MANNOS max conviction]
+    Tier 2 (75+): 200% min target, 25% trail, 60min
+    Tier 1 (<75): 150% min target, 20% trail, 45min  [default / fail-open]
+    """
+    if claude_score >= 85:
+        return {"min_target_pct": 400, "trail_pct": 30, "time_stop_min": 90}
+    elif claude_score >= 75:
+        return {"min_target_pct": 200, "trail_pct": 25, "time_stop_min": 60}
+    else:
+        return {"min_target_pct": 150, "trail_pct": 20, "time_stop_min": 45}
+
+
+def _mannos_exit_check(
+    pnl_pct: float,
+    drop_from_peak: float,
+    elapsed_min: float,
+    min_target_hit: bool,
+    tier: dict,
+) -> str | None:
+    """
+    Pure-function exit decision for MANNOS tiered trailing take profit.
+    Returns an exit reason string, or None if position should be held.
+
+    Before min_target_hit:
+      - Hard floor at MANNOS_HARD_FLOOR_PCT (-20%) from entry
+      - Time stop at tier["time_stop_min"]
+
+    After min_target_hit:
+      - Trailing stop at tier["trail_pct"] below peak
+      - Time stop at tier["time_stop_min"]
+    """
+    if min_target_hit:
+        if drop_from_peak <= -tier["trail_pct"]:
+            return (
+                f"MANNOS TRAIL {pnl_pct:+.1f}% "
+                f"(peak drop {abs(drop_from_peak):.1f}% > trail {tier['trail_pct']}%)"
+            )
+        if elapsed_min >= tier["time_stop_min"]:
+            return f"TIME STOP ({elapsed_min:.0f}m | tier limit {tier['time_stop_min']}m)"
+    else:
+        if pnl_pct <= MANNOS_HARD_FLOOR_PCT:
+            return f"HARD FLOOR {pnl_pct:+.1f}% (pre-target protection)"
+        if elapsed_min >= tier["time_stop_min"]:
+            return f"TIME STOP ({elapsed_min:.0f}m | tier limit {tier['time_stop_min']}m)"
+    return None
+
+
 # --- Trade detection --------------------------------------------------
 
 def extract_token_buy(tx: dict, whale_address: str) -> str | None:
@@ -619,17 +673,33 @@ async def check_and_maybe_exit(
         f"peak_drop={drop_from_peak:.1f}% | {elapsed_min:.0f}m elapsed"
     )
 
-    # Check exit conditions (take profit first — never cut a winner early)
-    exit_reason = None
-    if pnl_pct >= TAKE_PROFIT_PCT:
-        exit_reason = f"TAKE PROFIT +{pnl_pct:.1f}%"
-    elif drop_from_peak <= -TRAILING_STOP_PCT:
-        exit_reason = (
-            f"TRAILING STOP {pnl_pct:+.1f}% "
-            f"(dropped {abs(drop_from_peak):.1f}% from peak)"
+    # --- MANNOS tiered exit ---
+    claude_score   = pos.get("claude_score", 70)
+    min_target_hit = pos.get("min_target_hit", False)
+    tier           = get_exit_tier(claude_score)
+
+    # Activate trailing stop once min target is reached (latches — never resets)
+    if not min_target_hit and pnl_pct >= tier["min_target_pct"]:
+        open_positions[token_mint]["min_target_hit"] = True
+        min_target_hit = True
+        logger.info(
+            f"[EXIT] {token_mint[:8]} | Min target {tier['min_target_pct']}% reached | "
+            f"Trail {tier['trail_pct']}% now active | Confidence tier: {claude_score}"
         )
-    elif elapsed_min >= TIME_STOP_MIN:
-        exit_reason = f"TIME STOP ({elapsed_min:.0f}m elapsed)"
+
+    logger.debug(
+        f"[EXIT] {token_mint[:8]} | Peak: {peak_sol:.4f} SOL | Current: {current_sol:.4f} SOL | "
+        f"Trail: {tier['trail_pct']}% | Confidence tier: {claude_score} | "
+        f"Action: {'TRAILING' if min_target_hit else 'HOLDING'}"
+    )
+
+    exit_reason = _mannos_exit_check(
+        pnl_pct=pnl_pct,
+        drop_from_peak=drop_from_peak,
+        elapsed_min=elapsed_min,
+        min_target_hit=min_target_hit,
+        tier=tier,
+    )
 
     if exit_reason is None:
         return  # no exit condition met this tick
@@ -1248,6 +1318,9 @@ async def poll_whale(
                 "amount_tokens": token_units,
                 "whale":         name,
                 "buy_sol":       buy_sol,
+                "claude_score":  70,        # placeholder — real value wired in Task 5
+                "min_target_hit": False,
+                "source":        "whale",
             }
             logger.info(
                 f"[{token_mint[:8]}] Position opened — "
