@@ -216,7 +216,7 @@ async def fetch_dexscreener(
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
             resp.raise_for_status()
             data  = await resp.json()
-            pairs = data.get("pairs") or []
+            pairs = data if isinstance(data, list) else (data.get("pairs") or [])
             if not pairs:
                 return None
             # Pick the pair with the highest USD liquidity
