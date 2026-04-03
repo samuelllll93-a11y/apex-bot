@@ -10,7 +10,9 @@ import re
 import asyncio
 import logging
 import time
+import json
 import aiohttp
+import anthropic
 import requests
 from dotenv import load_dotenv
 
@@ -235,6 +237,63 @@ def passes_dex_quality(pair_data: dict) -> tuple[bool, str]:
     if v5m < MIN_DEX_5M_VOLUME_USD:
         return False, f"5m vol ${v5m:,.0f} below ${MIN_DEX_5M_VOLUME_USD:,}"
     return True, f"liq=${liq:,.0f} 5m_vol=${v5m:,.0f}"
+
+
+# --- Claude confidence scoring ----------------------------------------
+
+async def get_claude_score(
+    token_mint: str,
+    dex_pair: dict | None,
+    prebond_progress: float | None,
+    context_note: str = "",
+) -> int:
+    """
+    Ask Claude to score a token's short-term trading potential 0-100.
+    Fails open at 70 if ANTHROPIC_API_KEY is absent or API call fails.
+    Never logs the API key value.
+    """
+    api_key = os.getenv("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        logger.warning("ANTHROPIC_API_KEY not set — Claude score defaulting to 70 (fail-open)")
+        return 70
+
+    liq  = (dex_pair.get("liquidity")   or {}).get("usd", 0)  if dex_pair else 0
+    v5m  = (dex_pair.get("volume")      or {}).get("m5",  0)  if dex_pair else 0
+    v1h  = (dex_pair.get("volume")      or {}).get("h1",  0)  if dex_pair else 0
+    p5m  = (dex_pair.get("priceChange") or {}).get("m5",  0)  if dex_pair else 0
+    p1h  = (dex_pair.get("priceChange") or {}).get("h1",  0)  if dex_pair else 0
+
+    prompt = (
+        "You are a Solana memecoin trading analyst. Score this token's short-term "
+        "(1-2h) trading potential from 0 to 100 based on these on-chain metrics:\n\n"
+        f"Liquidity USD:    ${liq:,.0f}\n"
+        f"5m Volume USD:    ${v5m:,.0f}\n"
+        f"1h Volume USD:    ${v1h:,.0f}\n"
+        f"5m Price Change:  {p5m:+.1f}%\n"
+        f"1h Price Change:  {p1h:+.1f}%\n"
+    )
+    if prebond_progress is not None:
+        prompt += f"Bonding curve progress: {prebond_progress:.1f}%\n"
+    if context_note:
+        prompt += f"Context: {context_note}\n"
+    prompt += (
+        "\nRespond with ONLY a single integer 0-100. "
+        "No explanation, no punctuation — just the number."
+    )
+
+    try:
+        client = anthropic.AsyncAnthropic(api_key=api_key)
+        resp   = await client.messages.create(
+            model="claude-haiku-4-5",
+            max_tokens=10,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        score = max(0, min(100, int(resp.content[0].text.strip())))
+        logger.info(f"[CLAUDE] {token_mint[:8]} scored {score}/100")
+        return score
+    except Exception as e:
+        logger.warning(f"[CLAUDE] Scoring failed for {token_mint[:8]}: {e} — defaulting to 70")
+        return 70
 
 
 # --- Trade detection --------------------------------------------------
