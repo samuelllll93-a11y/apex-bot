@@ -83,6 +83,17 @@ MIN_DEX_5M_VOLUME_USD = 10_000
 PUMPFUN_API          = "https://frontend-api.pump.fun/coins"
 PREBOND_POS_SIZE_PCT = 0.02   # 2% of current SOL balance for prebond entries
 
+# --- Dip sniper -------------------------------------------------------
+GRADUATED_WATCHLIST_PATH = "data/graduated_watchlist.json"
+DIP_SNIPER_DROP_PCT      = 50.0   # trigger re-entry if price drops X% from ATH
+DIP_SNIPER_MIN_SCORE     = 65     # minimum Claude score to enter a dip
+DIP_SNIPER_WATCH_HOURS   = 8      # expire tokens from watchlist after X hours
+DIP_SNIPER_CHECK_SEC     = 60     # how often the dip sniper loop runs
+
+# In-memory graduated watchlist (loaded from disk at startup)
+# mint → {graduation_price_sol: float, ath_sol: float, added_ts: float}
+graduated_watchlist: dict[str, dict] = {}
+
 # Open positions: token_mint → position dict (populated after every buy)
 open_positions: dict[str, dict] = {}
 
@@ -284,9 +295,50 @@ async def fetch_prebond_progress(
         return None, False
 
 
+# --- Dip sniper watchlist helpers ------------------------------------
+
+def _load_graduated_watchlist(path: str = GRADUATED_WATCHLIST_PATH) -> dict:
+    """Load the graduated watchlist from disk. Returns {} on any error."""
+    try:
+        with open(path, "r") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        logger.warning(f"[DIP SNIPER] Could not load watchlist from {path}: {e}")
+        return {}
+
+
+def _save_graduated_watchlist(
+    watchlist: dict,
+    path: str = GRADUATED_WATCHLIST_PATH,
+) -> None:
+    """Persist the graduated watchlist to disk. Silently swallows write errors."""
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            json.dump(watchlist, f, indent=2)
+    except Exception as e:
+        logger.warning(f"[DIP SNIPER] Could not save watchlist to {path}: {e}")
+
+
 def _add_to_graduated_watchlist(token_mint: str, graduation_price_sol: float) -> None:
-    """Stub — full implementation added in Task 4 (dip sniper)."""
-    pass
+    """
+    Add a graduated token to the dip sniper watchlist.
+    No-op if already present (preserves existing ATH data).
+    """
+    if token_mint in graduated_watchlist:
+        return
+    graduated_watchlist[token_mint] = {
+        "graduation_price_sol": graduation_price_sol,
+        "ath_sol":              graduation_price_sol,
+        "added_ts":             time.time(),
+    }
+    _save_graduated_watchlist(graduated_watchlist)
+    logger.info(
+        f"[DIP SNIPER] Added {token_mint[:8]} to watchlist "
+        f"(grad price {graduation_price_sol:.6f} SOL)"
+    )
 
 
 # --- Claude confidence scoring ----------------------------------------
@@ -398,6 +450,138 @@ def _mannos_exit_check(
         if elapsed_min >= tier["time_stop_min"]:
             return f"TIME STOP ({elapsed_min:.0f}m | tier limit {tier['time_stop_min']}m)"
     return None
+
+
+async def dip_sniper_loop(
+    session: aiohttp.ClientSession,
+    wallet_pubkey: str,
+) -> None:
+    """
+    Every DIP_SNIPER_CHECK_SEC seconds:
+    1. Expire tokens older than DIP_SNIPER_WATCH_HOURS.
+    2. Fetch current price via DexScreener for each watchlist token.
+    3. Update ATH.
+    4. If price dropped DIP_SNIPER_DROP_PCT% from ATH, call Claude.
+    5. If Claude score >= DIP_SNIPER_MIN_SCORE and token not in open_positions, buy.
+    """
+    logger.info(f"Dip sniper started — watching {len(graduated_watchlist)} token(s)")
+    rpc_url = _rpc_url
+
+    while True:
+        await asyncio.sleep(DIP_SNIPER_CHECK_SEC)
+
+        now = time.time()
+        # Expire old entries
+        expired = [
+            m for m, d in graduated_watchlist.items()
+            if (now - d["added_ts"]) / 3600 > DIP_SNIPER_WATCH_HOURS
+        ]
+        for m in expired:
+            del graduated_watchlist[m]
+            logger.info(f"[DIP SNIPER] {m[:8]} | Action: EXPIRED (>{DIP_SNIPER_WATCH_HOURS}h)")
+        if expired:
+            _save_graduated_watchlist(graduated_watchlist)
+
+        for token_mint, entry in list(graduated_watchlist.items()):
+            # Skip if already in open positions — no double buy
+            if token_mint in open_positions:
+                logger.debug(f"[DIP SNIPER] {token_mint[:8]} | Action: WATCHING (already in position)")
+                continue
+
+            # Fetch current price from DexScreener
+            pair = await fetch_dexscreener(session, token_mint)
+            if pair is None:
+                logger.debug(f"[DIP SNIPER] {token_mint[:8]} | Action: WATCHING (no DexScreener data)")
+                continue
+
+            current_price_sol = float((pair.get("priceNative") or 0) or 0)
+            if current_price_sol <= 0:
+                continue
+
+            # Update ATH
+            if current_price_sol > entry["ath_sol"]:
+                graduated_watchlist[token_mint]["ath_sol"] = current_price_sol
+                entry["ath_sol"] = current_price_sol
+
+            ath      = entry["ath_sol"]
+            drop_pct = (ath - current_price_sol) / ath * 100 if ath > 0 else 0.0
+
+            logger.debug(
+                f"[DIP SNIPER] {token_mint[:8]} | ATH: {ath:.6f} SOL | "
+                f"Current: {current_price_sol:.6f} SOL | Drop: {drop_pct:.1f}% | Action: WATCHING"
+            )
+
+            if drop_pct < DIP_SNIPER_DROP_PCT:
+                continue
+
+            logger.info(
+                f"[DIP SNIPER] {token_mint[:8]} | ATH: {ath:.6f} SOL | "
+                f"Current: {current_price_sol:.6f} SOL | Drop: {drop_pct:.1f}% | Action: TRIGGERED"
+            )
+
+            # Get Claude score
+            claude_score = await get_claude_score(
+                token_mint, pair, None,
+                f"dip sniper — {drop_pct:.0f}% drop from ATH of {ath:.6f} SOL"
+            )
+            if claude_score < DIP_SNIPER_MIN_SCORE:
+                logger.info(
+                    f"[DIP SNIPER] {token_mint[:8]} | Claude score {claude_score} < "
+                    f"{DIP_SNIPER_MIN_SCORE} — skipping re-entry"
+                )
+                continue
+
+            # Balance check
+            sol_balance = get_sol_balance(rpc_url, wallet_pubkey)
+            if sol_balance < LOW_BALANCE_SOL:
+                logger.warning(
+                    f"[DIP SNIPER] {token_mint[:8]} | LOW BALANCE {sol_balance:.4f} SOL — skip"
+                )
+                continue
+
+            buy_sol    = round(sol_balance * PREBOND_POS_SIZE_PCT, 4)   # 2% of balance
+            amount_lam = int(buy_sol * 1_000_000_000)
+            quote      = await get_jupiter_quote(session, token_mint, amount_lam)
+            if not quote:
+                logger.error(f"[DIP SNIPER] {token_mint[:8]} | Jupiter quote failed — skipping")
+                continue
+
+            send_telegram(
+                f"🎯 <b>DIP SNIPER</b> — <code>{token_mint[:8]}</code>\n"
+                f"Dropped {drop_pct:.0f}% from ATH | Claude: {claude_score}/100\n"
+                f"Buying {buy_sol} SOL worth…"
+            )
+
+            swap_sig, swap_msg = await execute_swap(session, quote, wallet_pubkey)
+            if not swap_sig:
+                logger.error(f"[DIP SNIPER] {token_mint[:8]} | Swap failed: {swap_msg}")
+                continue
+
+            token_units = int(quote.get("outAmount", 0))
+            entry_sol   = int(quote.get("inAmount",  0)) / 1_000_000_000
+            if token_units > 0:
+                open_positions[token_mint] = {
+                    "entry_time":     time.time(),
+                    "entry_sol":      entry_sol,
+                    "peak_sol":       entry_sol,
+                    "amount_tokens":  token_units,
+                    "whale":          "dip_sniper",
+                    "buy_sol":        buy_sol,
+                    "claude_score":   claude_score,
+                    "min_target_hit": False,
+                    "source":         "dip_sniper",
+                }
+                _stats["trades_executed"] += 1
+                logger.info(
+                    f"[DIP SNIPER] {token_mint[:8]} | Entered {token_units:,} tokens "
+                    f"@ {entry_sol:.4f} SOL | Claude: {claude_score}"
+                )
+                send_telegram(
+                    f"✅ <b>DIP SNIPER BUY</b> — <code>{token_mint[:8]}</code>\n"
+                    f"Entry: {entry_sol:.4f} SOL | Score: {claude_score}/100\n"
+                    f"Sig: <code>{swap_sig}</code>"
+                )
+                asyncio.create_task(emergency_dump_check(session, token_mint, wallet_pubkey))
 
 
 # --- Trade detection --------------------------------------------------
@@ -1395,12 +1579,17 @@ async def run():
             f"longest expiry {longest_min:.0f}min from now"
         )
 
+    # Load dip sniper watchlist from disk
+    graduated_watchlist.update(_load_graduated_watchlist())
+    logger.info(f"Dip sniper watchlist loaded: {len(graduated_watchlist)} token(s)")
+
     async with aiohttp.ClientSession() as session:
         await asyncio.gather(
             whale_poll_loop(session, rpc_url, wallet_pubkey),
             position_monitor_loop(session, wallet_pubkey),
             midnight_summary_loop(),
             telegram_command_loop(),
+            dip_sniper_loop(session, wallet_pubkey),
         )
 
 
