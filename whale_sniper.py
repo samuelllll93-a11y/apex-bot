@@ -79,6 +79,10 @@ DEXSCREENER_API       = "https://api.dexscreener.com/tokens/v1/solana"
 MIN_DEX_LIQUIDITY_USD = 20_000
 MIN_DEX_5M_VOLUME_USD = 10_000
 
+# --- PumpFun prebond filter -------------------------------------------
+PUMPFUN_API          = "https://frontend-api.pump.fun/coins"
+PREBOND_POS_SIZE_PCT = 0.02   # 2% of current SOL balance for prebond entries
+
 # Open positions: token_mint → position dict (populated after every buy)
 open_positions: dict[str, dict] = {}
 
@@ -95,6 +99,7 @@ _rpc_url: str = ""
 _stats: dict = {
     "signals_detected":       0,   # every whale buy signal seen
     "cancelled_dexscreener":  0,   # filtered by liquidity / volume check
+    "cancelled_prebond":      0,   # filtered by PumpFun bonding curve check
     "cancelled_entry_delay":  0,   # filtered by 60s price-dump test
     "trades_executed":        0,   # buys that confirmed on-chain
     "wins":                   0,   # closed positions with PnL >= 0
@@ -237,6 +242,51 @@ def passes_dex_quality(pair_data: dict) -> tuple[bool, str]:
     if v5m < MIN_DEX_5M_VOLUME_USD:
         return False, f"5m vol ${v5m:,.0f} below ${MIN_DEX_5M_VOLUME_USD:,}"
     return True, f"liq=${liq:,.0f} 5m_vol=${v5m:,.0f}"
+
+
+# --- PumpFun prebond layer --------------------------------------------
+
+def prebond_decision(progress: float) -> tuple[int, str]:
+    """
+    Given bonding curve progress (0-100), return (score, action).
+    action is "PROCEED" or "BLOCK".
+      0-40%:  score 55, PROCEED (early entry)
+      40-70%: score 75, PROCEED (mid-curve momentum)
+      70%+:   score  0, BLOCK  (too late — near graduation, thin exit window)
+    """
+    if progress >= 70.0:
+        return 0, "BLOCK"
+    elif progress >= 40.0:
+        return 75, "PROCEED"
+    else:
+        return 55, "PROCEED"
+
+
+async def fetch_prebond_progress(
+    session: aiohttp.ClientSession,
+    token_mint: str,
+) -> tuple[float | None, bool]:
+    """
+    Query PumpFun API for bonding curve progress.
+    Returns (progress_pct, is_graduated).
+    Returns (None, False) on any error — callers must fail-open.
+    """
+    url = f"{PUMPFUN_API}/{token_mint}"
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=6)) as resp:
+            resp.raise_for_status()
+            data     = await resp.json()
+            progress = float(data.get("bonding_curve_progress", 0) or 0)
+            is_grad  = bool(data.get("complete", False))
+            return progress, is_grad
+    except Exception as e:
+        logger.debug(f"[PREBOND] PumpFun API failed for {token_mint[:8]}: {e} — fail-open")
+        return None, False
+
+
+def _add_to_graduated_watchlist(token_mint: str, graduation_price_sol: float) -> None:
+    """Stub — full implementation added in Task 4 (dip sniper)."""
+    pass
 
 
 # --- Claude confidence scoring ----------------------------------------
@@ -844,6 +894,7 @@ def _send_daily_summary() -> None:
         f"📊 <b>APEX Daily Summary</b> ({date_str})\n\n"
         f"Signals detected:         {_stats['signals_detected']}\n"
         f"Cancelled (DexScreener):  {_stats['cancelled_dexscreener']}\n"
+        f"Cancelled (prebond):      {_stats['cancelled_prebond']}\n"
         f"Cancelled (60s dump):     {_stats['cancelled_entry_delay']}\n"
         f"Trades executed:          {total}\n"
         f"Wins / Losses:            {wins} / {losses}  ({win_rate})\n"
@@ -860,7 +911,7 @@ def _send_daily_summary() -> None:
 
 def _reset_stats() -> None:
     """Zero all daily counters — called immediately after midnight summary."""
-    for key in ("signals_detected", "cancelled_dexscreener", "cancelled_entry_delay",
+    for key in ("signals_detected", "cancelled_dexscreener", "cancelled_prebond", "cancelled_entry_delay",
                 "trades_executed", "wins", "losses"):
         _stats[key] = 0
     _stats["net_pnl_sol"] = 0.0
@@ -1052,6 +1103,36 @@ async def poll_whale(
             logger.info(f"[{name}] DexScreener OK — {dex_reason}")
         # ----------------------------------------------------------------
 
+        # --- PumpFun prebond check -------------------------------------
+        prebond_pct, is_graduated = await fetch_prebond_progress(session, token_mint)
+        prebond_buy_sol: float | None = None  # set to override BUY_AMOUNT_SOL for prebond entries
+
+        if prebond_pct is None:
+            # PumpFun API unreachable — not a pump.fun token or API down — fail-open
+            logger.debug(f"[PREBOND] No pump.fun data for {token_mint[:8]} — proceeding normally")
+        elif is_graduated:
+            # Token already graduated — add to dip sniper watchlist, proceed to DexScreener
+            logger.info(f"[PREBOND] {token_mint[:8]} already graduated — proceeding to DexScreener")
+            if dex_pair is not None:
+                grad_price = float((dex_pair.get("priceNative") or 0) or 0)
+                _add_to_graduated_watchlist(token_mint, grad_price)
+        else:
+            pb_score, pb_action = prebond_decision(prebond_pct)
+            if pb_action == "BLOCK":
+                logger.info(
+                    f"[PREBOND] BLOCKED — curve at {prebond_pct:.0f}%, too late for entry "
+                    f"({token_mint[:8]})"
+                )
+                _stats["cancelled_prebond"] += 1
+                continue
+            # PROCEED — use 2% of current SOL balance as position size
+            prebond_buy_sol = round(sol_balance * PREBOND_POS_SIZE_PCT, 4)
+            logger.info(
+                f"[PREBOND] Curve: {prebond_pct:.0f}% | Score: {pb_score} | "
+                f"Position: 2% ({prebond_buy_sol} SOL) | Action: PROCEED"
+            )
+        # ----------------------------------------------------------------
+
         # --- 60-second entry delay with price-direction check — Fix 1 --
         send_telegram(
             f"⏳ <b>[{name.upper()}]</b> signal detected on "
@@ -1094,12 +1175,16 @@ async def poll_whale(
         )
         # ----------------------------------------------------------------
 
-        # --- Position sizing — conviction multiplier only after quality gates — Fix 3
-        if is_high_conviction:
+        # --- Position sizing — prebond override takes priority, then conviction ---
+        if prebond_buy_sol is not None:
+            # Prebond entry: fixed 2% of balance (no conviction multiplier on prebond)
+            buy_sol = prebond_buy_sol
+            logger.info(f"[{name}] Prebond position size: {buy_sol} SOL (2% of balance)")
+        elif is_high_conviction:
             buy_sol = round(BUY_AMOUNT_SOL * CONVICTION_MULTIPLIER, 4)
             logger.info(
                 f"[{name.upper()}] HIGH CONVICTION sizing confirmed — "
-                f"{buy_sol} SOL (all quality gates passed)"
+                f"{buy_sol} SOL ({CONVICTION_MULTIPLIER}x normal)"
             )
         else:
             buy_sol = BUY_AMOUNT_SOL
