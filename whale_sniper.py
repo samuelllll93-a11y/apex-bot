@@ -14,6 +14,7 @@ import json
 import aiohttp
 import anthropic
 import requests
+from logging.handlers import TimedRotatingFileHandler
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -23,6 +24,20 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger("whale_sniper")
+
+# --- File logging: daily rotation, 7-day history ----------------------
+_log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+os.makedirs(_log_dir, exist_ok=True)
+_file_handler = TimedRotatingFileHandler(
+    filename=os.path.join(_log_dir, "whale_sniper.log"),
+    when="midnight",
+    interval=1,
+    backupCount=7,
+    encoding="utf-8",
+)
+_file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+logger.addHandler(_file_handler)
+# ----------------------------------------------------------------------
 
 # --- Config -----------------------------------------------------------
 
