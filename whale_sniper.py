@@ -362,12 +362,12 @@ async def get_claude_score(
 ) -> int:
     """
     Ask Claude to score a token's short-term trading potential 0-100.
-    Fails open at 70 if ANTHROPIC_API_KEY is absent or API call fails.
+    Fails open at 70 if CLAUDE_API_KEY is absent or API call fails.
     Never logs the API key value.
     """
-    api_key = os.getenv("ANTHROPIC_API_KEY", "")
+    api_key = os.getenv("CLAUDE_API_KEY", "")
     if not api_key:
-        logger.warning("ANTHROPIC_API_KEY not set — Claude score defaulting to 70 (fail-open)")
+        logger.warning("CLAUDE_API_KEY not set — Claude score defaulting to 70 (fail-open)")
         return 70
 
     liq  = (dex_pair.get("liquidity")   or {}).get("usd", 0)  if dex_pair else 0

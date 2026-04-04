@@ -15,7 +15,7 @@ def test_get_claude_score_returns_int_in_range():
     mock_response.content = [MagicMock(text="72")]
 
     async def _run():
-        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}):
+        with patch.dict(os.environ, {"CLAUDE_API_KEY": "test-key"}):
             with patch("anthropic.AsyncAnthropic") as mock_cls:
                 mock_client = AsyncMock()
                 mock_client.messages.create = AsyncMock(return_value=mock_response)
@@ -40,7 +40,7 @@ def test_get_claude_score_clamps_above_100():
     mock_response.content = [MagicMock(text="150")]
 
     async def _run():
-        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}):
+        with patch.dict(os.environ, {"CLAUDE_API_KEY": "test-key"}):
             with patch("anthropic.AsyncAnthropic") as mock_cls:
                 mock_client = AsyncMock()
                 mock_client.messages.create = AsyncMock(return_value=mock_response)
@@ -56,7 +56,7 @@ def test_get_claude_score_clamps_below_0():
     mock_response.content = [MagicMock(text="-10")]
 
     async def _run():
-        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}):
+        with patch.dict(os.environ, {"CLAUDE_API_KEY": "test-key"}):
             with patch("anthropic.AsyncAnthropic") as mock_cls:
                 mock_client = AsyncMock()
                 mock_client.messages.create = AsyncMock(return_value=mock_response)
@@ -69,7 +69,7 @@ def test_get_claude_score_clamps_below_0():
 def test_get_claude_score_fails_open_on_api_error():
     """Returns 70 (default) when Anthropic API raises an exception."""
     async def _run():
-        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}):
+        with patch.dict(os.environ, {"CLAUDE_API_KEY": "test-key"}):
             with patch("anthropic.AsyncAnthropic") as mock_cls:
                 mock_client = AsyncMock()
                 mock_client.messages.create = AsyncMock(side_effect=Exception("API error"))
@@ -80,9 +80,9 @@ def test_get_claude_score_fails_open_on_api_error():
 
 
 def test_get_claude_score_no_api_key_returns_70():
-    """Returns 70 when ANTHROPIC_API_KEY is not set — no API call made."""
+    """Returns 70 when CLAUDE_API_KEY is not set — no API call made."""
     async def _run():
-        env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
+        env = {k: v for k, v in os.environ.items() if k != "CLAUDE_API_KEY"}
         with patch.dict(os.environ, env, clear=True):
             return await whale_sniper.get_claude_score("abc", None, None, "")
 
