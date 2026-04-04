@@ -105,6 +105,18 @@ PREBOND_POS_SIZE_PCT = 0.02   # 2% of current SOL balance for prebond entries
 # Prebond check, 60s price delay, and Claude scoring still run as normal.
 MANNOS_AUTOPILOT = True   # set False to restore DexScreener filter for mannos
 
+# --- MR.PUTIN Config --------------------------------------------------
+# Ultra-early PumpFun entries: sub-$5k mcap, 1% position, 2h min hold, 3-day time stop
+MRPUTIN_CONFIG: dict = {
+    "max_mcap_usd":      5_000,   # Skip if mcap > $5k at signal time
+    "bypass_dexscreener": True,
+    "position_size_pct": 0.01,   # 1% of current SOL balance
+    "hard_floor_pct":    -20.0,  # Stop loss from entry
+    "trail_pct":         20.0,   # Trailing stop from peak
+    "min_hold_mins":     120,    # Never sell before 2 hours
+    "time_stop_mins":    4_320,  # Force exit after 3 days (3×24×60)
+}
+
 # --- Dip sniper -------------------------------------------------------
 GRADUATED_WATCHLIST_PATH = "data/graduated_watchlist.json"
 DIP_SNIPER_DROP_PCT      = 50.0   # trigger re-entry if price drops X% from ATH
@@ -323,6 +335,26 @@ async def fetch_prebond_progress(
         return None, False
 
 
+async def fetch_pump_mcap(
+    session: aiohttp.ClientSession,
+    token_mint: str,
+) -> float | None:
+    """
+    Fetch usd_market_cap from PumpFun API for the mr.putin mcap gate.
+    Returns None on API failure — callers must fail-open.
+    """
+    url = f"{PUMPFUN_API}/{token_mint}"
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=6)) as resp:
+            resp.raise_for_status()
+            data = await resp.json()
+            mcap = data.get("usd_market_cap")
+            return float(mcap) if mcap else None
+    except Exception as e:
+        logger.debug(f"[MR.PUTIN] pump.fun mcap fetch failed for {token_mint[:8]}: {e} — fail-open")
+        return None
+
+
 # --- Dip sniper watchlist helpers ------------------------------------
 
 def _load_graduated_watchlist(path: str = GRADUATED_WATCHLIST_PATH) -> dict:
@@ -478,6 +510,35 @@ def _mannos_exit_check(
             return f"HARD FLOOR {pnl_pct:+.1f}% (pre-target protection)"
         if tier["time_stop_min"] is not None and elapsed_min >= tier["time_stop_min"]:
             return f"TIME STOP ({elapsed_min:.0f}m | tier limit {tier['time_stop_min']}m)"
+    return None
+
+
+def _mrputin_exit_check(
+    pnl_pct: float,
+    drop_from_peak: float,
+    elapsed_min: float,
+) -> str | None:
+    """
+    Pure-function exit decision for MR.PUTIN wallet positions.
+
+    Rules (all apply only after min_hold_mins):
+      - Hard floor: -20% from entry (stop loss)
+      - Trailing stop: -20% from peak
+      - Time stop: 3 days (4320 min)
+
+    Returns an exit reason string, or None if position should be held.
+    """
+    if elapsed_min < MRPUTIN_CONFIG["min_hold_mins"]:
+        return None  # minimum hold period — never exit early
+    if pnl_pct <= MRPUTIN_CONFIG["hard_floor_pct"]:
+        return f"MR.PUTIN HARD FLOOR {pnl_pct:+.1f}%"
+    if drop_from_peak <= -MRPUTIN_CONFIG["trail_pct"]:
+        return (
+            f"MR.PUTIN TRAIL {pnl_pct:+.1f}% "
+            f"(peak drop {abs(drop_from_peak):.1f}% > {MRPUTIN_CONFIG['trail_pct']}%)"
+        )
+    if elapsed_min >= MRPUTIN_CONFIG["time_stop_mins"]:
+        return f"MR.PUTIN TIME STOP ({elapsed_min:.0f}m | 3-day limit)"
     return None
 
 
@@ -936,13 +997,20 @@ async def check_and_maybe_exit(
         f"Action: {'TRAILING' if min_target_hit else 'HOLDING'}"
     )
 
-    exit_reason = _mannos_exit_check(
-        pnl_pct=pnl_pct,
-        drop_from_peak=drop_from_peak,
-        elapsed_min=elapsed_min,
-        min_target_hit=min_target_hit,
-        tier=tier,
-    )
+    if pos.get("whale") == "mr.putin":
+        exit_reason = _mrputin_exit_check(
+            pnl_pct=pnl_pct,
+            drop_from_peak=drop_from_peak,
+            elapsed_min=elapsed_min,
+        )
+    else:
+        exit_reason = _mannos_exit_check(
+            pnl_pct=pnl_pct,
+            drop_from_peak=drop_from_peak,
+            elapsed_min=elapsed_min,
+            min_target_hit=min_target_hit,
+            tier=tier,
+        )
 
     if exit_reason is None:
         return  # no exit condition met this tick
@@ -1431,9 +1499,9 @@ async def poll_whale(
         # ----------------------------------------------------------------
 
         # --- DexScreener quality check — Fix 2 -------------------------
-        if MANNOS_AUTOPILOT and name == "mannos":
+        if (MANNOS_AUTOPILOT and name == "mannos") or name == "mr.putin":
             logger.info(
-                f"[MANNOS AUTOPILOT] Bypassing DexScreener — direct entry "
+                f"[{name.upper()} AUTOPILOT] Bypassing DexScreener — direct entry "
                 f"({token_mint[:8]})"
             )
             dex_pair = await fetch_dexscreener(session, token_mint)  # still fetch for Claude scoring
@@ -1454,6 +1522,22 @@ async def poll_whale(
                     _stats["cancelled_dexscreener"] += 1
                     continue
                 logger.info(f"[{name}] DexScreener OK — {dex_reason}")
+        # ----------------------------------------------------------------
+
+        # --- MR.PUTIN mcap gate ----------------------------------------
+        if name == "mr.putin":
+            _mrputin_mcap = await fetch_pump_mcap(session, token_mint)
+            if _mrputin_mcap is not None and _mrputin_mcap > MRPUTIN_CONFIG["max_mcap_usd"]:
+                logger.info(
+                    f"[MR.PUTIN] SKIP — mcap ${_mrputin_mcap:,.0f} exceeds "
+                    f"$5k threshold ({token_mint[:8]})"
+                )
+                _stats["cancelled_dexscreener"] += 1
+                continue
+            if _mrputin_mcap is not None:
+                logger.info(f"[MR.PUTIN] mcap gate OK — ${_mrputin_mcap:,.0f} (≤$5k)")
+            else:
+                logger.info(f"[MR.PUTIN] mcap gate: pump.fun unavailable — fail-open ({token_mint[:8]})")
         # ----------------------------------------------------------------
 
         # --- PumpFun prebond check -------------------------------------
@@ -1544,8 +1628,15 @@ async def poll_whale(
         )
         # ----------------------------------------------------------------
 
-        # --- Position sizing — prebond override takes priority, then conviction ---
-        if prebond_buy_sol is not None:
+        # --- Position sizing — mr.putin > prebond > conviction > normal ---
+        if name == "mr.putin":
+            buy_sol = round(sol_balance * MRPUTIN_CONFIG["position_size_pct"], 4)
+            logger.info(
+                f"[MR.PUTIN] Position: {buy_sol} SOL (1% balance) | "
+                f"min hold {MRPUTIN_CONFIG['min_hold_mins']}m | "
+                f"time stop {MRPUTIN_CONFIG['time_stop_mins']}m"
+            )
+        elif prebond_buy_sol is not None:
             # Prebond entry: fixed 2% of balance (no conviction multiplier on prebond)
             buy_sol = prebond_buy_sol
             logger.info(f"[{name}] Prebond position size: {buy_sol} SOL (2% of balance)")
