@@ -22,11 +22,11 @@ def test_tier_low_confidence_upper_boundary():
     assert t["min_target_pct"] == 150
 
 def test_tier_mid_confidence():
-    """75-84 → 200% target, 25% trail, 60min."""
+    """75-84 → 200% target, 25% trail, no time stop."""
     t = whale_sniper.get_exit_tier(75)
     assert t["min_target_pct"] == 200
     assert t["trail_pct"] == 25
-    assert t["time_stop_min"] == 60
+    assert t["time_stop_min"] is None
 
 def test_tier_mid_confidence_upper_boundary():
     """84 is still tier 2."""
@@ -34,11 +34,11 @@ def test_tier_mid_confidence_upper_boundary():
     assert t["min_target_pct"] == 200
 
 def test_tier_high_confidence():
-    """85+ → 400% target, 30% trail, 90min."""
+    """85+ → 400% target, 30% trail, no time stop."""
     t = whale_sniper.get_exit_tier(85)
     assert t["min_target_pct"] == 400
     assert t["trail_pct"] == 30
-    assert t["time_stop_min"] == 90
+    assert t["time_stop_min"] is None
 
 def test_tier_high_confidence_100():
     """100 still returns tier 3."""
@@ -126,3 +126,25 @@ def test_hard_floor_not_active_after_min_target():
         tier={"min_target_pct": 150, "trail_pct": 20, "time_stop_min": 45},
     )
     assert reason is None  # trail is only 15%, below 20% threshold
+
+def test_time_stop_none_never_fires_before_min_target():
+    """Tier 2/3 with time_stop_min=None — never exits on time alone."""
+    reason = whale_sniper._mannos_exit_check(
+        pnl_pct=50.0,
+        drop_from_peak=0.0,
+        elapsed_min=9999.0,   # absurdly long time
+        min_target_hit=False,
+        tier={"min_target_pct": 200, "trail_pct": 25, "time_stop_min": None},
+    )
+    assert reason is None
+
+def test_time_stop_none_never_fires_after_min_target():
+    """Tier 2/3 with time_stop_min=None — no time exit even after min target hit."""
+    reason = whale_sniper._mannos_exit_check(
+        pnl_pct=250.0,
+        drop_from_peak=-5.0,
+        elapsed_min=9999.0,
+        min_target_hit=True,
+        tier={"min_target_pct": 200, "trail_pct": 25, "time_stop_min": None},
+    )
+    assert reason is None

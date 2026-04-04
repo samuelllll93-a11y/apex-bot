@@ -405,14 +405,15 @@ MANNOS_HARD_FLOOR_PCT = -20.0  # max loss before min target — protects against
 def get_exit_tier(claude_score: int) -> dict:
     """
     Return exit parameters for a given Claude confidence score.
-    Tier 3 (85+): 400% min target, 30% trail, 90min  [MANNOS max conviction]
-    Tier 2 (75+): 200% min target, 25% trail, 60min
-    Tier 1 (<75): 150% min target, 20% trail, 45min  [default / fail-open]
+    Tier 3 (85+): 400% min target, 30% trail, no time stop  [MANNOS max conviction]
+    Tier 2 (75+): 200% min target, 25% trail, no time stop
+    Tier 1 (<75): 150% min target, 20% trail, 45min time stop  [default / fail-open]
+    time_stop_min=None means the position runs indefinitely until trail or hard floor.
     """
     if claude_score >= 85:
-        return {"min_target_pct": 400, "trail_pct": 30, "time_stop_min": 90}
+        return {"min_target_pct": 400, "trail_pct": 30, "time_stop_min": None}
     elif claude_score >= 75:
-        return {"min_target_pct": 200, "trail_pct": 25, "time_stop_min": 60}
+        return {"min_target_pct": 200, "trail_pct": 25, "time_stop_min": None}
     else:
         return {"min_target_pct": 150, "trail_pct": 20, "time_stop_min": 45}
 
@@ -430,11 +431,11 @@ def _mannos_exit_check(
 
     Before min_target_hit:
       - Hard floor at MANNOS_HARD_FLOOR_PCT (-20%) from entry
-      - Time stop at tier["time_stop_min"]
+      - Time stop at tier["time_stop_min"] (skipped if None — Tier 2/3)
 
     After min_target_hit:
       - Trailing stop at tier["trail_pct"] below peak
-      - Time stop at tier["time_stop_min"]
+      - Time stop at tier["time_stop_min"] (skipped if None — Tier 2/3)
     """
     if min_target_hit:
         if drop_from_peak <= -tier["trail_pct"]:
@@ -442,12 +443,12 @@ def _mannos_exit_check(
                 f"MANNOS TRAIL {pnl_pct:+.1f}% "
                 f"(peak drop {abs(drop_from_peak):.1f}% > trail {tier['trail_pct']}%)"
             )
-        if elapsed_min >= tier["time_stop_min"]:
+        if tier["time_stop_min"] is not None and elapsed_min >= tier["time_stop_min"]:
             return f"TIME STOP ({elapsed_min:.0f}m | tier limit {tier['time_stop_min']}m)"
     else:
         if pnl_pct <= MANNOS_HARD_FLOOR_PCT:
             return f"HARD FLOOR {pnl_pct:+.1f}% (pre-target protection)"
-        if elapsed_min >= tier["time_stop_min"]:
+        if tier["time_stop_min"] is not None and elapsed_min >= tier["time_stop_min"]:
             return f"TIME STOP ({elapsed_min:.0f}m | tier limit {tier['time_stop_min']}m)"
     return None
 
