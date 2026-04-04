@@ -458,6 +458,14 @@ async def get_claude_score(
         return 70
 
 
+# --- Telegram message helpers -----------------------------------------
+
+def _token_label(token_mint: str, dex_pair: dict | None) -> str:
+    """Return 'SYMBOL (AbCd1234)' if DexScreener symbol available, else 'AbCd1234...'."""
+    symbol = ((dex_pair or {}).get("baseToken") or {}).get("symbol", "")
+    return f"{symbol} ({token_mint[:8]})" if symbol else token_mint[:8]
+
+
 # --- MANNOS tiered exit logic -----------------------------------------
 
 MANNOS_HARD_FLOOR_PCT = -20.0  # max loss before min target — protects against dumps
@@ -1678,10 +1686,11 @@ async def poll_whale(
             continue
 
         # High conviction gets its own priority Telegram alert first
+        token_label = _token_label(token_mint, dex_pair)
         if is_high_conviction:
             send_telegram(
                 f"🔥 <b>HIGH CONVICTION</b> — [{name.upper()}] bought "
-                f"<code>{token_mint[:8]}</code> twice in 30 mins\n"
+                f"<code>{token_label}</code> twice in 30 mins\n"
                 f"Position size: {buy_sol} SOL ({CONVICTION_MULTIPLIER}x normal)"
             )
 
@@ -1689,9 +1698,9 @@ async def poll_whale(
         msg = (
             f"🐋 <b>APEX WHALE COPY</b> [{name.upper()}]\n"
             f"{conviction_badge}"
-            f"Token: <code>{token_mint}</code>\n"
+            f"Token: <code>{token_label}</code>\n"
             f"Amount: {buy_sol} SOL\n"
-            f"Whale sig: <code>{sig}</code>\n"
+            f"Whale: <code>{name.upper()}</code>\n"
             f"Our sig: <code>{swap_sig}</code>"
         )
         logger.info(msg)
