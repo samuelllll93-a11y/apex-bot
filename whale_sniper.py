@@ -590,16 +590,34 @@ def extract_token_buy(tx: dict, whale_address: str) -> str | None:
     """
     Inspect a parsed transaction for a token buy (SOL out, SPL token in).
     Returns the token mint address if a buy is detected, else None.
+    Debug-level logs explain every None return so silent failures are visible.
     """
     if not tx:
+        logger.debug("[extract_token_buy] tx is None/empty — skipping")
         return None
 
     meta = tx.get("meta") or {}
     if meta.get("err"):
+        logger.debug(f"[extract_token_buy] tx has on-chain error: {meta['err']} — skipping")
         return None   # failed tx
 
     pre_balances  = meta.get("preTokenBalances")  or []
     post_balances = meta.get("postTokenBalances") or []
+
+    if not post_balances:
+        logger.debug("[extract_token_buy] postTokenBalances is empty — not a token buy tx")
+        return None
+
+    # uiAmount can be null for brand-new PumpFun pre-bond mints.
+    # Fall back to raw integer amount ÷ 10^decimals so pre-bond buys are detected.
+    def token_amount(b: dict) -> float:
+        ui        = b.get("uiTokenAmount") or {}
+        ui_amount = ui.get("uiAmount")
+        if ui_amount is not None:
+            return float(ui_amount)
+        raw      = int(ui.get("amount", "0") or "0")
+        decimals = int(ui.get("decimals", 0)  or 0)
+        return raw / (10 ** decimals) if decimals >= 0 else float(raw)
 
     # Build maps: owner -> {mint: amount}
     def balance_map(balances: list) -> dict[str, dict[str, float]]:
@@ -607,7 +625,7 @@ def extract_token_buy(tx: dict, whale_address: str) -> str | None:
         for b in balances:
             owner  = b.get("owner", "")
             mint   = b.get("mint", "")
-            amount = float((b.get("uiTokenAmount") or {}).get("uiAmount") or 0)
+            amount = token_amount(b)
             m.setdefault(owner, {})[mint] = amount
         return m
 
@@ -618,6 +636,13 @@ def extract_token_buy(tx: dict, whale_address: str) -> str | None:
     whale_pre  = pre.get(whale_address,  {})
     whale_post = post.get(whale_address, {})
 
+    if not whale_post:
+        logger.debug(
+            f"[extract_token_buy] whale {whale_address[:8]} not in postTokenBalances "
+            f"— owners seen: {[o[:8] for o in list(post.keys())[:3]]}"
+        )
+        return None
+
     for mint, post_amount in whale_post.items():
         if mint in (SOL_MINT, WSOL_MINT):
             continue
@@ -625,10 +650,15 @@ def extract_token_buy(tx: dict, whale_address: str) -> str | None:
         if post_amount > pre_amount:
             logger.info(
                 f"Detected buy: whale {whale_address[:8]} "
-                f"received {post_amount - pre_amount:.4f} of {mint[:8]}"
+                f"received {post_amount - pre_amount:.6f} of {mint[:8]}"
             )
             return mint
 
+    logger.debug(
+        f"[extract_token_buy] whale {whale_address[:8]} — no balance increase found "
+        f"in {len(whale_post)} post-balance entries "
+        f"(mints: {[m[:8] for m in whale_post if m not in (SOL_MINT, WSOL_MINT)][:3]})"
+    )
     return None
 
 
@@ -1273,6 +1303,10 @@ async def poll_whale(
         token_mint = extract_token_buy(tx, wallet)
 
         if not token_mint:
+            logger.debug(
+                f"[WHALE] [{name}] {sig[:16]}… — processed, result: SKIPPED "
+                f"(no token buy detected — see extract_token_buy debug above)"
+            )
             continue
 
         logger.info(f"[{name}] BUY signal → {token_mint}")
@@ -1556,7 +1590,13 @@ async def whale_poll_loop(
             poll_whale(session, name, wallet, rpc_url, wallet_pubkey)
             for name, wallet in WHALE_WALLETS.items()
         ]
-        await asyncio.gather(*tasks, return_exceptions=True)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for wname, result in zip(WHALE_WALLETS.keys(), results):
+            if isinstance(result, Exception):
+                logger.error(
+                    f"[WHALE] [{wname}] poll_whale raised unhandled exception: "
+                    f"{type(result).__name__}: {result}"
+                )
         await asyncio.sleep(POLL_INTERVAL_SEC)
 
 
