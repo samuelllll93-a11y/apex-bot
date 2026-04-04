@@ -257,14 +257,17 @@ def passes_dex_quality(pair_data: dict) -> tuple[bool, str]:
 
 # --- PumpFun prebond layer --------------------------------------------
 
-def prebond_decision(progress: float) -> tuple[int, str]:
+def prebond_decision(progress: float | None) -> tuple[int, str]:
     """
     Given bonding curve progress (0-100), return (score, action).
-    action is "PROCEED" or "BLOCK".
+    action is "PROCEED", "BLOCK", or "GRADUATED".
+      None:   score  0, GRADUATED (token already graduated — skip prebond scoring)
       0-40%:  score 55, PROCEED (early entry)
       40-70%: score 75, PROCEED (mid-curve momentum)
       70%+:   score  0, BLOCK  (too late — near graduation, thin exit window)
     """
+    if progress is None:
+        return 0, "GRADUATED"
     if progress >= 70.0:
         return 0, "BLOCK"
     elif progress >= 40.0:
@@ -287,9 +290,12 @@ async def fetch_prebond_progress(
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=6)) as resp:
             resp.raise_for_status()
             data     = await resp.json()
-            progress = float(data.get("bonding_curve_progress", 0) or 0)
             is_grad  = bool(data.get("complete", False))
-            return progress, is_grad
+            raw_prog = data.get("bonding_curve_progress")
+            if is_grad or raw_prog is None:
+                # complete=True or missing curve field both mean graduated
+                return 100.0, True
+            return float(raw_prog), False
     except Exception as e:
         logger.debug(f"[PREBOND] PumpFun API failed for {token_mint[:8]}: {e} — fail-open")
         return None, False

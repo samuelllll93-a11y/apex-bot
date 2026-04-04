@@ -52,6 +52,13 @@ def test_prebond_decision_zero_is_low():
     assert score == 55
 
 
+def test_prebond_decision_none_is_graduated():
+    """None progress → GRADUATED (token already on PumpSwap)."""
+    score, action = whale_sniper.prebond_decision(None)
+    assert action == "GRADUATED"
+    assert score == 0
+
+
 # --- fetch_prebond_progress() --------------------------------------------
 
 def test_fetch_prebond_progress_not_graduated():
@@ -77,7 +84,7 @@ def test_fetch_prebond_progress_not_graduated():
     assert is_grad is False
 
 
-def test_fetch_prebond_progress_graduated():
+def test_fetch_prebond_progress_graduated_complete_true():
     """Returns (100.0, True) when complete=True."""
     mock_resp = AsyncMock()
     mock_resp.status = 200
@@ -96,6 +103,53 @@ def test_fetch_prebond_progress_graduated():
         return await whale_sniper.fetch_prebond_progress(mock_session, "GraduatedMint")
 
     pct, is_grad = asyncio.run(_run())
+    assert pct == 100.0
+    assert is_grad is True
+
+
+def test_fetch_prebond_progress_graduated_missing_curve_field():
+    """Returns (100.0, True) when bonding_curve_progress is missing — treat as graduated."""
+    mock_resp = AsyncMock()
+    mock_resp.status = 200
+    mock_resp.raise_for_status = MagicMock()
+    mock_resp.json = AsyncMock(return_value={
+        "complete": False,
+        # bonding_curve_progress key absent entirely
+    })
+    mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+    mock_resp.__aexit__ = AsyncMock(return_value=False)
+
+    mock_session = MagicMock()
+    mock_session.get = MagicMock(return_value=mock_resp)
+
+    async def _run():
+        return await whale_sniper.fetch_prebond_progress(mock_session, "WeirdMint")
+
+    pct, is_grad = asyncio.run(_run())
+    assert pct == 100.0
+    assert is_grad is True
+
+
+def test_fetch_prebond_progress_graduated_null_curve_field():
+    """Returns (100.0, True) when bonding_curve_progress is null — treat as graduated."""
+    mock_resp = AsyncMock()
+    mock_resp.status = 200
+    mock_resp.raise_for_status = MagicMock()
+    mock_resp.json = AsyncMock(return_value={
+        "bonding_curve_progress": None,
+        "complete": False,
+    })
+    mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+    mock_resp.__aexit__ = AsyncMock(return_value=False)
+
+    mock_session = MagicMock()
+    mock_session.get = MagicMock(return_value=mock_resp)
+
+    async def _run():
+        return await whale_sniper.fetch_prebond_progress(mock_session, "NullCurveMint")
+
+    pct, is_grad = asyncio.run(_run())
+    assert pct == 100.0
     assert is_grad is True
 
 
