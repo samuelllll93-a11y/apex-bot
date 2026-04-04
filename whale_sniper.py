@@ -1124,6 +1124,7 @@ async def telegram_command_loop() -> None:
     last_update_id = 0
 
     async with aiohttp.ClientSession() as tg_session:
+        fail_count = 0
         while True:
             try:
                 params = {"timeout": 30, "offset": last_update_id + 1}
@@ -1134,13 +1135,22 @@ async def telegram_command_loop() -> None:
                 ) as resp:
                     resp.raise_for_status()
                     data = await resp.json()
+                fail_count = 0  # reset backoff on any successful response
             except Exception as e:
-                logger.warning(f"getUpdates failed: {e}")
-                await asyncio.sleep(5)
+                fail_count += 1
+                delay = min(5 * (2 ** (fail_count - 1)), 300)
+                logger.warning(
+                    f"getUpdates failed ({type(e).__name__}: {e!r}) — "
+                    f"retry in {delay}s (attempt {fail_count})"
+                )
+                await asyncio.sleep(delay)
                 continue
 
             if not data.get("ok"):
-                logger.error(f"Telegram getUpdates error: {data.get('description', data)}")
+                logger.error(
+                    f"Telegram getUpdates error: {data.get('description', data)} "
+                    f"(error_code={data.get('error_code')})"
+                )
                 await asyncio.sleep(5)
                 continue
 
@@ -1261,6 +1271,25 @@ def startup_checks(rpc_url: str, wallet_pubkey: str) -> None:
             "Startup Telegram test: FAILED — check errors above. "
             f"URL being called: https://api.telegram.org/bot{token[:10]}…/sendMessage"
         )
+
+    # 4. Validate bot token via Telegram getMe -------------------------
+    try:
+        me_resp = requests.get(
+            f"https://api.telegram.org/bot{token}/getMe",
+            timeout=5,
+        )
+        me_data = me_resp.json()
+        if me_data.get("ok"):
+            bot_name = me_data["result"].get("username", "unknown")
+            logger.info(f"Telegram bot identity: @{bot_name} ✓")
+        else:
+            logger.error(
+                f"Telegram getMe FAILED — token is invalid or bot was revoked. "
+                f"Description: {me_data.get('description')} "
+                f"(error_code={me_data.get('error_code')})"
+            )
+    except Exception as e:
+        logger.error(f"Telegram getMe check failed: {type(e).__name__}: {e}")
 
 
 # --- Main loop --------------------------------------------------------
