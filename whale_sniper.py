@@ -83,6 +83,11 @@ MIN_DEX_5M_VOLUME_USD = 10_000
 PUMPFUN_API          = "https://frontend-api.pump.fun/coins"
 PREBOND_POS_SIZE_PCT = 0.02   # 2% of current SOL balance for prebond entries
 
+# --- MANNOS Autopilot -------------------------------------------------
+# When True: mannos whale signals bypass DexScreener quality checks entirely.
+# Prebond check, 60s price delay, and Claude scoring still run as normal.
+MANNOS_AUTOPILOT = True   # set False to restore DexScreener filter for mannos
+
 # --- Dip sniper -------------------------------------------------------
 GRADUATED_WATCHLIST_PATH = "data/graduated_watchlist.json"
 DIP_SNIPER_DROP_PCT      = 50.0   # trigger re-entry if price drops X% from ATH
@@ -1409,22 +1414,29 @@ async def poll_whale(
         # ----------------------------------------------------------------
 
         # --- DexScreener quality check — Fix 2 -------------------------
-        dex_pair = await fetch_dexscreener(session, token_mint)
-        if dex_pair is None:
-            logger.warning(
-                f"[{name}] DexScreener unavailable for {token_mint[:8]} "
-                f"— proceeding (fail-open)"
+        if MANNOS_AUTOPILOT and name == "mannos":
+            logger.info(
+                f"[MANNOS AUTOPILOT] Bypassing DexScreener — direct entry "
+                f"({token_mint[:8]})"
             )
+            dex_pair = await fetch_dexscreener(session, token_mint)  # still fetch for Claude scoring
         else:
-            dex_ok, dex_reason = passes_dex_quality(dex_pair)
-            if not dex_ok:
-                logger.info(
-                    f"[{name}] SKIP — DexScreener quality fail: {dex_reason} "
-                    f"({token_mint[:8]})"
+            dex_pair = await fetch_dexscreener(session, token_mint)
+            if dex_pair is None:
+                logger.warning(
+                    f"[{name}] DexScreener unavailable for {token_mint[:8]} "
+                    f"— proceeding (fail-open)"
                 )
-                _stats["cancelled_dexscreener"] += 1
-                continue
-            logger.info(f"[{name}] DexScreener OK — {dex_reason}")
+            else:
+                dex_ok, dex_reason = passes_dex_quality(dex_pair)
+                if not dex_ok:
+                    logger.info(
+                        f"[{name}] SKIP — DexScreener quality fail: {dex_reason} "
+                        f"({token_mint[:8]})"
+                    )
+                    _stats["cancelled_dexscreener"] += 1
+                    continue
+                logger.info(f"[{name}] DexScreener OK — {dex_reason}")
         # ----------------------------------------------------------------
 
         # --- PumpFun prebond check -------------------------------------
