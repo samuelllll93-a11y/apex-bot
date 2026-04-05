@@ -1290,18 +1290,104 @@ def _summary_message() -> str:
     )
 
 
+async def _holdings_message(session: aiohttp.ClientSession) -> str:
+    """
+    Build a live holdings snapshot for the /holdings Telegram command.
+    Fetches fresh MC from DexScreener and SOL price from CoinGecko for each position.
+    Fails open — missing data shows '—' rather than crashing.
+    """
+    if not open_positions:
+        return "📊 No current holdings"
+
+    # Fetch SOL/USD price from CoinGecko once for all positions
+    sol_usd = 0.0
+    try:
+        async with session.get(
+            "https://api.coingecko.com/api/v3/simple/price",
+            params={"ids": "solana", "vs_currencies": "usd"},
+            timeout=aiohttp.ClientTimeout(total=5),
+        ) as resp:
+            cg_data = await resp.json()
+            sol_usd = float((cg_data.get("solana") or {}).get("usd") or 0)
+    except Exception as e:
+        logger.debug(f"[HOLDINGS] CoinGecko fetch failed: {e} — USD estimate omitted")
+
+    _NUM_EMOJIS = ["1️⃣","2️⃣","3️⃣","4️⃣","5️⃣","6️⃣","7️⃣","8️⃣","9️⃣","🔟"]
+    lines: list[str] = ["📊 <b>Current Holdings</b>"]
+    total_entry_sol = 0.0
+    total_worth_sol = 0.0
+
+    for idx, (token_mint, pos) in enumerate(open_positions.items()):
+        num     = _NUM_EMOJIS[idx] if idx < len(_NUM_EMOJIS) else f"{idx + 1}."
+        entry_sol = pos.get("entry_sol", 0.0)
+        mc_entry  = pos.get("mc_entry",  0.0)
+        tl        = pos.get("token_label") or token_mint[:8]
+        whale     = (pos.get("whale") or "?").upper()
+        tp1_hit   = pos.get("min_target_hit", False)
+
+        # Fresh MC from DexScreener
+        dex_now = await fetch_dexscreener(session, token_mint)
+        mc_now  = float((dex_now or {}).get("marketCap") or (dex_now or {}).get("fdv") or 0)
+
+        # Worth and PnL derived from MC ratio
+        if mc_entry and mc_now:
+            worth_sol = entry_sol * (mc_now / mc_entry)
+            pnl_pct   = (mc_now - mc_entry) / mc_entry * 100
+        else:
+            worth_sol = entry_sol
+            pnl_pct   = 0.0
+
+        total_entry_sol += entry_sol
+        total_worth_sol += worth_sol
+
+        color    = "🟢" if pnl_pct >= 0 else "🔴"
+        pnl_sign = "+" if pnl_pct >= 0 else ""
+        tp1_icon = "✅" if tp1_hit else "❌"
+
+        lines.append(
+            f"\n{num} <b>{tl}</b>\n"
+            f"   Whale: {whale}\n"
+            f"   Entry MC:  {_fmt_usd(mc_entry) if mc_entry else '—'}\n"
+            f"   Current MC: {_fmt_usd(mc_now) if mc_now else '—'} "
+            f"{color} {pnl_sign}{pnl_pct:.0f}%\n"
+            f"   Entry: {entry_sol:.4f} SOL | Worth: ~{worth_sol:.4f} SOL\n"
+            f"   TP1 hit: {tp1_icon}"
+        )
+
+    # Footer totals
+    overall_pnl   = (total_worth_sol / total_entry_sol - 1) * 100 if total_entry_sol else 0.0
+    overall_color = "🟢" if overall_pnl >= 0 else "🔴"
+    overall_sign  = "+" if overall_pnl >= 0 else ""
+
+    lines.append(
+        f"\n💼 Total in: {total_entry_sol:.4f} SOL\n"
+        f"📈 Total worth: ~{total_worth_sol:.4f} SOL\n"
+        f"{overall_color} Overall: {overall_sign}{overall_pnl:.0f}%"
+    )
+    if sol_usd:
+        lines.append(
+            f"💵 Est. USD value: ~{_fmt_usd(total_worth_sol * sol_usd)}"
+            f" (SOL @ ${sol_usd:,.2f})"
+        )
+
+    return "\n".join(lines)
+
+
 def _register_commands() -> None:
-    """Register /summary in Telegram's bot command menu."""
+    """Register bot commands in Telegram's command menu."""
     token = os.getenv("TELEGRAM_BOT_TOKEN", "")
     if not token:
         return
     try:
         requests.post(
             f"https://api.telegram.org/bot{token}/setMyCommands",
-            json={"commands": [{"command": "summary", "description": "12-hour trade summary"}]},
+            json={"commands": [
+                {"command": "summary",  "description": "12-hour trade summary"},
+                {"command": "holdings", "description": "Current open positions"},
+            ]},
             timeout=5,
         )
-        logger.info("Telegram /summary command registered")
+        logger.info("Telegram commands registered (/summary, /holdings)")
     except Exception as e:
         logger.warning(f"setMyCommands failed: {e}")
 
@@ -1312,7 +1398,7 @@ async def telegram_command_loop() -> None:
     Uses its own aiohttp session so the 30-second long-poll never competes
     with the shared session used by the whale poller and position monitor.
     """
-    logger.info("Telegram command loop started — listening for /summary")
+    logger.info("Telegram command loop started — listening for /summary, /holdings")
 
     token   = os.getenv("TELEGRAM_BOT_TOKEN", "")
     chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -1372,6 +1458,19 @@ async def telegram_command_loop() -> None:
                             logger.info("/summary command handled")
                     except Exception as e:
                         logger.warning(f"/summary reply failed: {e}")
+
+                elif text.startswith("/holdings") and cid == chat_id:
+                    reply = await _holdings_message(tg_session)
+                    try:
+                        async with tg_session.post(
+                            f"{base_url}/sendMessage",
+                            json={"chat_id": chat_id, "text": reply, "parse_mode": "HTML"},
+                            timeout=aiohttp.ClientTimeout(total=15),
+                        ) as r:
+                            r.raise_for_status()
+                            logger.info("/holdings command handled")
+                    except Exception as e:
+                        logger.warning(f"/holdings reply failed: {e}")
 
 
 # --- Daily summary ----------------------------------------------------
