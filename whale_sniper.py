@@ -1108,6 +1108,12 @@ async def check_and_maybe_exit(
     pnl_sign = "+" if pnl_pct >= 0 else ""
     emoji    = "💰" if pnl_pct >= 0 else "🛑"
 
+    # Fetch exit MC for sell summary (non-blocking; fails open to "—")
+    _sell_dex = await fetch_dexscreener(session, token_mint)
+    mc_exit   = float((_sell_dex or {}).get("marketCap") or (_sell_dex or {}).get("fdv") or 0)
+    mc_entry_stored  = pos.get("mc_entry", 0)
+    token_label_sell = pos.get("token_label") or token_mint[:8]
+
     # Remove from open_positions *before* logging so monitor doesn't re-enter
     del open_positions[token_mint]
 
@@ -1127,17 +1133,24 @@ async def check_and_maybe_exit(
     _stats["net_pnl_sol"] = round(_stats["net_pnl_sol"] + (current_sol - entry_sol), 6)
     _record_trade(current_sol - entry_sol)
 
+    mc_entry_str = _fmt_usd(mc_entry_stored) if mc_entry_stored else "—"
+    mc_exit_str  = _fmt_usd(mc_exit)         if mc_exit         else "—"
+
     logger.info(
         f"[{token_mint[:8]}] {exit_reason} | "
         f"Entry: {entry_sol:.4f} SOL | Exit: {current_sol:.4f} SOL | "
         f"PnL: {pnl_sign}{pnl_pct:.1f}%"
     )
     send_telegram(
-        f"{emoji} <b>SELL [{token_mint[:8]}]</b>\n"
+        f"{emoji} <b>SELL</b> — {token_label_sell}\n"
         f"Reason: {exit_reason}\n"
-        f"Entry: {entry_sol:.4f} SOL | Exit: {current_sol:.4f} SOL\n"
-        f"PnL: {pnl_sign}{pnl_pct:.1f}%\n"
-        f"Sig: <code>{sell_sig}</code>"
+        f"\n📊 <b>Trade Summary:</b>\n"
+        f"  MC Entry:  {mc_entry_str}\n"
+        f"  MC Exit:   {mc_exit_str}\n"
+        f"  Entry:     {entry_sol:.4f} SOL\n"
+        f"  Exit:      {current_sol:.4f} SOL\n"
+        f"  PnL:       {pnl_sign}{pnl_pct:.1f}%\n"
+        f"\nSig: <code>{sell_sig}</code>"
     )
 
 
@@ -1754,6 +1767,9 @@ async def poll_whale(
 
         # High conviction gets its own priority Telegram alert first
         token_label = _token_label(token_mint, dex_pair)
+        mc_entry    = float(
+            (dex_pair or {}).get("marketCap") or (dex_pair or {}).get("fdv") or 0
+        )
         if is_high_conviction:
             send_telegram(
                 f"🔥 <b>HIGH CONVICTION</b> — [{name.upper()}] bought "
@@ -1762,13 +1778,22 @@ async def poll_whale(
             )
 
         conviction_badge = "🔥 HIGH CONVICTION\n" if is_high_conviction else ""
+        mc_entry_str     = _fmt_usd(mc_entry) if mc_entry else "—"
+        tp_block         = (
+            f"\n\n🎯 <b>Targets:</b>\n"
+            f"  TP1: {_fmt_usd(mc_entry * 2)} (2x)\n"
+            f"  TP2: {_fmt_usd(mc_entry * 5)} (5x)\n"
+            f"  TP3: {_fmt_usd(mc_entry * 10)} (10x)"
+        ) if mc_entry else ""
         msg = (
             f"🐋 <b>APEX WHALE COPY</b> [{name.upper()}]\n"
             f"{conviction_badge}"
             f"Token: <code>{token_label}</code>\n"
             f"Amount: {buy_sol} SOL\n"
+            f"MC Entry: {mc_entry_str}\n"
             f"Whale: <code>{name.upper()}</code>\n"
             f"Our sig: <code>{swap_sig}</code>"
+            f"{tp_block}"
         )
         logger.info(msg)
         send_telegram(msg)
@@ -1787,6 +1812,8 @@ async def poll_whale(
                 "claude_score":  claude_score,
                 "min_target_hit": False,
                 "source":        "whale",
+                "mc_entry":      mc_entry,
+                "token_label":   token_label,
             }
             logger.info(
                 f"[{token_mint[:8]}] Position opened — "
