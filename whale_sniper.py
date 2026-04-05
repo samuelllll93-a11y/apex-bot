@@ -83,10 +83,6 @@ TRAILING_STOP_PCT  = float(os.getenv("TRAILING_STOP_PCT", "0.10")) * 100  # .env
 TIME_STOP_MIN      = int(os.getenv("TIME_STOP_MIN", "30"))  # minutes
 POSITION_CHECK_SEC = 10     # how often the sell monitor loop runs
 
-# --- Entry confirmation parameters ------------------------------------
-ENTRY_DELAY_SEC  = 60     # wait before executing entry
-ENTRY_DUMP_PCT   = 3.0    # skip if price drops >3% in the delay window
-
 # --- Emergency exit parameters ----------------------------------------
 EMERGENCY_DUMP_PCT        = 5.0  # emergency exit if down >5% right after buy
 EMERGENCY_CHECK_DELAY_SEC = 5    # seconds after buy before emergency check runs
@@ -102,7 +98,7 @@ PREBOND_POS_SIZE_PCT = 0.02   # 2% of current SOL balance for prebond entries
 
 # --- MANNOS Autopilot -------------------------------------------------
 # When True: mannos whale signals bypass DexScreener quality checks entirely.
-# Prebond check, 60s price delay, and Claude scoring still run as normal.
+# Prebond check and Claude scoring still run as normal.
 MANNOS_AUTOPILOT = True   # set False to restore DexScreener filter for mannos
 
 # --- MR.PUTIN Config --------------------------------------------------
@@ -145,7 +141,6 @@ _stats: dict = {
     "signals_detected":       0,   # every whale buy signal seen
     "cancelled_dexscreener":  0,   # filtered by liquidity / volume check
     "cancelled_prebond":      0,   # filtered by PumpFun bonding curve check
-    "cancelled_entry_delay":  0,   # filtered by 60s price-dump test
     "trades_executed":        0,   # buys that confirmed on-chain
     "wins":                   0,   # closed positions with PnL >= 0
     "losses":                 0,   # closed positions with PnL < 0
@@ -491,62 +486,6 @@ def _sol_price_from_dex(dex_pair: dict | None) -> float:
     except (ValueError, TypeError):
         pass
     return 0.0
-
-
-def _format_signal_alert(
-    token_mint: str,
-    whale_name: str,
-    dex_pair: dict | None,
-    prebond_pct: float | None,
-    entry_delay_sec: int,
-) -> str:
-    """
-    Build the enriched ⏳ signal-detected Telegram message.
-    Uses DexScreener data when available; falls back to a minimal
-    prebond-style card when the token isn't listed yet.
-    """
-    if dex_pair:
-        bt      = (dex_pair.get("baseToken") or {})
-        symbol  = bt.get("symbol", "")
-        tname   = bt.get("name",   "")
-        mcap    = float(dex_pair.get("marketCap") or dex_pair.get("fdv") or 0)
-        v5m     = float((dex_pair.get("volume")      or {}).get("m5", 0) or 0)
-        p5m     = float((dex_pair.get("priceChange") or {}).get("m5", 0) or 0)
-        dex_url = dex_pair.get("url") or f"https://dexscreener.com/solana/{token_mint}"
-
-        name_line = f"🪙 <b>{symbol}</b>  {tname}" if tname and tname != symbol else f"🪙 <b>{symbol}</b>"
-        p5m_icon  = "📈" if p5m >= 0 else "📉"
-        mcap_str  = _fmt_usd(mcap) if mcap else "—"
-        v5m_str   = _fmt_usd(v5m)  if v5m  else "—"
-
-        return "\n".join([
-            f"⏳ <b>SIGNAL DETECTED</b> — [{whale_name.upper()}]",
-            "",
-            name_line,
-            f"<code>{token_mint}</code>",
-            "",
-            f"💰 MCap: {mcap_str}   {p5m_icon} 5m: {p5m:+.1f}%",
-            f"📊 Vol 5m: {v5m_str}",
-            "",
-            f'🔗 <a href="{dex_url}">View on DexScreener</a>',
-            "",
-            f"⏱ Waiting {entry_delay_sec}s to confirm price direction…",
-        ])
-
-    # No DexScreener data — prebond or not yet listed
-    lines = [
-        f"⏳ <b>SIGNAL DETECTED</b> — [{whale_name.upper()}]",
-        "",
-        f"🌱 <b>PREBOND</b>",
-        f"<code>{token_mint}</code>",
-    ]
-    if prebond_pct is not None:
-        lines.append(f"📈 Bonding curve: {prebond_pct:.0f}%")
-    lines += [
-        "",
-        f"⏱ Waiting {entry_delay_sec}s to confirm price direction…",
-    ]
-    return "\n".join(lines)
 
 
 # --- MANNOS tiered exit logic -----------------------------------------
@@ -1489,7 +1428,6 @@ def _send_daily_summary() -> None:
         f"Signals detected:         {_stats['signals_detected']}\n"
         f"Cancelled (DexScreener):  {_stats['cancelled_dexscreener']}\n"
         f"Cancelled (prebond):      {_stats['cancelled_prebond']}\n"
-        f"Cancelled (60s dump):     {_stats['cancelled_entry_delay']}\n"
         f"Trades executed:          {total}\n"
         f"Wins / Losses:            {wins} / {losses}  ({win_rate})\n"
         f"Net PnL:                  {pnl_sign}{net:.4f} SOL"
@@ -1497,7 +1435,6 @@ def _send_daily_summary() -> None:
     logger.info(
         f"DAILY SUMMARY | signals={_stats['signals_detected']} "
         f"cancelled_dex={_stats['cancelled_dexscreener']} "
-        f"cancelled_delay={_stats['cancelled_entry_delay']} "
         f"trades={total} W/L={wins}/{losses} pnl={pnl_sign}{net:.4f} SOL"
     )
     send_telegram(msg)
@@ -1505,7 +1442,7 @@ def _send_daily_summary() -> None:
 
 def _reset_stats() -> None:
     """Zero all daily counters — called immediately after midnight summary."""
-    for key in ("signals_detected", "cancelled_dexscreener", "cancelled_prebond", "cancelled_entry_delay",
+    for key in ("signals_detected", "cancelled_dexscreener", "cancelled_prebond",
                 "trades_executed", "wins", "losses"):
         _stats[key] = 0
     _stats["net_pnl_sol"] = 0.0
@@ -1773,48 +1710,13 @@ async def poll_whale(
             )
         # ----------------------------------------------------------------
 
-        # --- 60-second entry delay with price-direction check — Fix 1 --
-        send_telegram(_format_signal_alert(
-            token_mint=token_mint,
-            whale_name=name,
-            dex_pair=dex_pair,
-            prebond_pct=prebond_pct,
-            entry_delay_sec=ENTRY_DELAY_SEC,
-        ))
-
-        probe_lamports = int(BUY_AMOUNT_SOL * 1_000_000_000)
-        quote_t0 = await get_jupiter_quote(session, token_mint, probe_lamports)
-        if not quote_t0:
-            logger.error(f"[{name}] SKIP — T=0 quote failed for {token_mint[:8]}")
-            continue
-        price_t0 = int(quote_t0.get("outAmount", 0))
-
-        # Sleep releases the event loop — position_monitor_loop continues normally.
-        # Note: asyncio.gather waits for all whale coroutines, so the next poll
-        # cycle is delayed ~60s when an active signal is in progress.
-        await asyncio.sleep(ENTRY_DELAY_SEC)
-
-        quote_t60 = await get_jupiter_quote(session, token_mint, probe_lamports)
-        if not quote_t60:
-            logger.error(f"[{name}] SKIP — T=60 quote failed for {token_mint[:8]}")
-            continue
-        price_t60 = int(quote_t60.get("outAmount", 0))
-
-        # Higher outAmount at T=60 = same SOL buys more tokens = token is cheaper = dumped
-        dump_pct = (price_t60 / price_t0 - 1) * 100 if price_t0 > 0 else 0.0
-
-        if dump_pct > ENTRY_DUMP_PCT:
-            logger.info(
-                f"[{name}] Entry cancelled — {token_mint[:8]} dropped "
-                f"{dump_pct:.1f}% in {ENTRY_DELAY_SEC}s window"
-            )
-            _stats["cancelled_entry_delay"] += 1
-            continue
-
-        logger.info(
-            f"[{name}] Entry confirmed — {token_mint[:8]} price held/rose "
-            f"in {ENTRY_DELAY_SEC}s window (dump_pct={dump_pct:.1f}%)"
+        # --- Entry quote (immediate — no delay) ------------------------
+        entry_quote = await get_jupiter_quote(
+            session, token_mint, int(BUY_AMOUNT_SOL * 1_000_000_000)
         )
+        if not entry_quote:
+            logger.error(f"[{name}] SKIP — entry quote failed for {token_mint[:8]}")
+            continue
         # ----------------------------------------------------------------
 
         # --- Claude confidence scoring ---------------------------------
@@ -1855,9 +1757,9 @@ async def poll_whale(
             buy_sol = BUY_AMOUNT_SOL
         # ----------------------------------------------------------------
 
-        # Reuse T=60 quote for normal size; re-fetch only for conviction size
+        # Use entry quote for normal size; re-fetch for non-standard sizes
         if buy_sol == BUY_AMOUNT_SOL:
-            quote = quote_t60
+            quote = entry_quote
         else:
             amount_lamports = int(buy_sol * 1_000_000_000)
             quote = await get_jupiter_quote(session, token_mint, amount_lamports)
