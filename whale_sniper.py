@@ -475,6 +475,24 @@ def _fmt_usd(value: float) -> str:
     return f"${value:,.0f}"
 
 
+def _sol_price_from_dex(dex_pair: dict | None) -> float:
+    """
+    Derive SOL/USD price from a DexScreener pair.
+    Uses priceUsd / priceNative (both are fields on every Solana pair).
+    Returns 0.0 if either field is missing or zero.
+    """
+    if not dex_pair:
+        return 0.0
+    try:
+        price_usd    = float(dex_pair.get("priceUsd")    or 0)
+        price_native = float(dex_pair.get("priceNative") or 0)
+        if price_usd > 0 and price_native > 0:
+            return price_usd / price_native
+    except (ValueError, TypeError):
+        pass
+    return 0.0
+
+
 def _format_signal_alert(
     token_mint: str,
     whale_name: str,
@@ -1779,12 +1797,37 @@ async def poll_whale(
 
         conviction_badge = "🔥 HIGH CONVICTION\n" if is_high_conviction else ""
         mc_entry_str     = _fmt_usd(mc_entry) if mc_entry else "—"
-        tp_block         = (
-            f"\n\n🎯 <b>Targets:</b>\n"
-            f"  TP1: {_fmt_usd(mc_entry * 2)} (2x)\n"
-            f"  TP2: {_fmt_usd(mc_entry * 5)} (5x)\n"
-            f"  TP3: {_fmt_usd(mc_entry * 10)} (10x)"
-        ) if mc_entry else ""
+
+        if mc_entry:
+            _sol_px    = _sol_price_from_dex(dex_pair)
+            _entry_usd = buy_sol * _sol_px if _sol_px else 0.0
+            _sell_frac = TAKE_PROFIT_PCT / 100          # e.g. 0.5
+            _hold_frac = 1.0 - _sell_frac               # remaining after TP1
+            _sell_pct  = f"{int(TAKE_PROFIT_PCT)}%"
+
+            # TP1: sell sell_frac at 2x → returns sell_frac*2x of entry = full entry back
+            _tp1_take  = _sell_frac * 2 * _entry_usd
+            # TP2/TP3: hold_frac of tokens, priced at 5x and 10x of entry
+            _tp2_worth = _hold_frac * 5  * _entry_usd
+            _tp3_worth = _hold_frac * 10 * _entry_usd
+
+            if _entry_usd:
+                tp_block = (
+                    f"\n\n🎯 <b>Targets:</b>\n"
+                    f"  1️⃣ {_fmt_usd(mc_entry * 2)} (2x) → sell {_sell_pct} | take {_fmt_usd(_tp1_take)} back\n"
+                    f"  2️⃣ {_fmt_usd(mc_entry * 5)} (5x) → free ride | worth {_fmt_usd(_tp2_worth)}\n"
+                    f"  3️⃣ {_fmt_usd(mc_entry * 10)} (10x) → free ride | worth {_fmt_usd(_tp3_worth)}"
+                )
+            else:
+                # SOL price unavailable — show MC targets without USD projections
+                tp_block = (
+                    f"\n\n🎯 <b>Targets:</b>\n"
+                    f"  1️⃣ {_fmt_usd(mc_entry * 2)} (2x) → sell {_sell_pct}\n"
+                    f"  2️⃣ {_fmt_usd(mc_entry * 5)} (5x) → free ride\n"
+                    f"  3️⃣ {_fmt_usd(mc_entry * 10)} (10x) → free ride"
+                )
+        else:
+            tp_block = ""
         msg = (
             f"🐋 <b>APEX WHALE COPY</b> [{name.upper()}]\n"
             f"{conviction_badge}"
