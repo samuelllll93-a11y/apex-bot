@@ -466,6 +466,71 @@ def _token_label(token_mint: str, dex_pair: dict | None) -> str:
     return f"{symbol} ({token_mint[:8]})" if symbol else token_mint[:8]
 
 
+def _fmt_usd(value: float) -> str:
+    """Format a USD value compactly: $1.23M / $456.7K / $789."""
+    if value >= 1_000_000:
+        return f"${value / 1_000_000:.2f}M"
+    if value >= 1_000:
+        return f"${value / 1_000:.1f}K"
+    return f"${value:,.0f}"
+
+
+def _format_signal_alert(
+    token_mint: str,
+    whale_name: str,
+    dex_pair: dict | None,
+    prebond_pct: float | None,
+    entry_delay_sec: int,
+) -> str:
+    """
+    Build the enriched ⏳ signal-detected Telegram message.
+    Uses DexScreener data when available; falls back to a minimal
+    prebond-style card when the token isn't listed yet.
+    """
+    if dex_pair:
+        bt      = (dex_pair.get("baseToken") or {})
+        symbol  = bt.get("symbol", "")
+        tname   = bt.get("name",   "")
+        mcap    = float(dex_pair.get("marketCap") or dex_pair.get("fdv") or 0)
+        v5m     = float((dex_pair.get("volume")      or {}).get("m5", 0) or 0)
+        p5m     = float((dex_pair.get("priceChange") or {}).get("m5", 0) or 0)
+        dex_url = dex_pair.get("url") or f"https://dexscreener.com/solana/{token_mint}"
+
+        name_line = f"🪙 <b>{symbol}</b>  {tname}" if tname and tname != symbol else f"🪙 <b>{symbol}</b>"
+        p5m_icon  = "📈" if p5m >= 0 else "📉"
+        mcap_str  = _fmt_usd(mcap) if mcap else "—"
+        v5m_str   = _fmt_usd(v5m)  if v5m  else "—"
+
+        return "\n".join([
+            f"⏳ <b>SIGNAL DETECTED</b> — [{whale_name.upper()}]",
+            "",
+            name_line,
+            f"<code>{token_mint}</code>",
+            "",
+            f"💰 MCap: {mcap_str}   {p5m_icon} 5m: {p5m:+.1f}%",
+            f"📊 Vol 5m: {v5m_str}",
+            "",
+            f'🔗 <a href="{dex_url}">View on DexScreener</a>',
+            "",
+            f"⏱ Waiting {entry_delay_sec}s to confirm price direction…",
+        ])
+
+    # No DexScreener data — prebond or not yet listed
+    lines = [
+        f"⏳ <b>SIGNAL DETECTED</b> — [{whale_name.upper()}]",
+        "",
+        f"🌱 <b>PREBOND</b>",
+        f"<code>{token_mint}</code>",
+    ]
+    if prebond_pct is not None:
+        lines.append(f"📈 Bonding curve: {prebond_pct:.0f}%")
+    lines += [
+        "",
+        f"⏱ Waiting {entry_delay_sec}s to confirm price direction…",
+    ]
+    return "\n".join(lines)
+
+
 # --- MANNOS tiered exit logic -----------------------------------------
 
 MANNOS_HARD_FLOOR_PCT = -20.0  # max loss before min target — protects against dumps
@@ -1579,11 +1644,13 @@ async def poll_whale(
         # ----------------------------------------------------------------
 
         # --- 60-second entry delay with price-direction check — Fix 1 --
-        send_telegram(
-            f"⏳ <b>[{name.upper()}]</b> signal detected on "
-            f"<code>{token_mint[:8]}</code>\n"
-            f"Waiting {ENTRY_DELAY_SEC}s to confirm price direction…"
-        )
+        send_telegram(_format_signal_alert(
+            token_mint=token_mint,
+            whale_name=name,
+            dex_pair=dex_pair,
+            prebond_pct=prebond_pct,
+            entry_delay_sec=ENTRY_DELAY_SEC,
+        ))
 
         probe_lamports = int(BUY_AMOUNT_SOL * 1_000_000_000)
         quote_t0 = await get_jupiter_quote(session, token_mint, probe_lamports)
