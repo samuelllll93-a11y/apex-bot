@@ -1931,10 +1931,11 @@ def _register_commands() -> None:
             json={"commands": [
                 {"command": "summary",  "description": "12-hour trade summary"},
                 {"command": "holdings", "description": "Current open positions"},
+                {"command": "wallets",  "description": "Show tracked whale wallets"},
             ]},
             timeout=5,
         )
-        logger.info("Telegram commands registered (/summary, /holdings)")
+        logger.info("Telegram commands registered (/summary, /holdings, /wallets)")
     except Exception as e:
         logger.warning(f"setMyCommands failed: {e}")
 
@@ -2018,6 +2019,22 @@ async def telegram_command_loop() -> None:
                             logger.info("/holdings command handled")
                     except Exception as e:
                         logger.warning(f"/holdings reply failed: {e}")
+
+                elif text.startswith("/wallets") and cid == chat_id:
+                    lines = ["👛 <b>Tracked Wallets</b>"]
+                    for wname, waddr in WHALE_WALLETS.items():
+                        lines.append(f"\n🐋 <b>{wname.upper()}</b>\n<code>{waddr}</code>")
+                    reply = "\n".join(lines)
+                    try:
+                        async with tg_session.post(
+                            f"{base_url}/sendMessage",
+                            json={"chat_id": chat_id, "text": reply, "parse_mode": "HTML"},
+                            timeout=aiohttp.ClientTimeout(total=10),
+                        ) as r:
+                            r.raise_for_status()
+                            logger.info("/wallets command handled")
+                    except Exception as e:
+                        logger.warning(f"/wallets reply failed: {e}")
 
 
 # --- Daily summary ----------------------------------------------------
