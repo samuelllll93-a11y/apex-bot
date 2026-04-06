@@ -117,6 +117,7 @@ MRPUTIN_CONFIG: dict = {
 GRADUATED_WATCHLIST_PATH = "data/graduated_watchlist.json"
 DIP_SNIPER_DROP_PCT      = 50.0   # trigger re-entry if price drops X% from ATH
 DIP_SNIPER_MIN_SCORE     = 65     # minimum Claude score to enter a dip
+WHALE_MIN_SCORE          = 50     # minimum Claude score to enter a whale copy
 DIP_SNIPER_WATCH_HOURS   = 8      # expire tokens from watchlist after X hours
 DIP_SNIPER_CHECK_SEC     = 60     # how often the dip sniper loop runs
 
@@ -455,16 +456,21 @@ async def get_claude_score(
     dex_pair: dict | None,
     prebond_progress: float | None,
     context_note: str = "",
-) -> int:
+) -> tuple[int, list[str] | None]:
     """
     Ask Claude to score a token's short-term trading potential 0-100.
-    Fails open at 70 if CLAUDE_API_KEY is absent or API call fails.
+
+    Returns (score, bullets) where:
+      - bullets is a list of up to 4 short reasoning strings on success
+      - bullets is None if the API was unavailable or the call failed (fail-open)
+
+    Fails open at (70, None) if CLAUDE_API_KEY is absent or API call fails.
     Never logs the API key value.
     """
     api_key = os.getenv("CLAUDE_API_KEY", "")
     if not api_key:
         logger.warning("CLAUDE_API_KEY not set — Claude score defaulting to 70 (fail-open)")
-        return 70
+        return 70, None
 
     liq  = (dex_pair.get("liquidity")   or {}).get("usd", 0)  if dex_pair else 0
     v5m  = (dex_pair.get("volume")      or {}).get("m5",  0)  if dex_pair else 0
@@ -486,23 +492,45 @@ async def get_claude_score(
     if context_note:
         prompt += f"Context: {context_note}\n"
     prompt += (
-        "\nRespond with ONLY a single integer 0-100. "
-        "No explanation, no punctuation — just the number."
+        "\nRespond in this exact format — no other text:\n"
+        "SCORE: <integer 0-100>\n"
+        "- <reason 1, max 10 words>\n"
+        "- <reason 2, max 10 words>\n"
+        "- <reason 3, max 10 words>\n"
+        "- <reason 4, max 10 words>\n"
+        "Omit bullet lines you don't need. No other text."
     )
 
     try:
         client = anthropic.AsyncAnthropic(api_key=api_key)
         resp   = await client.messages.create(
             model="claude-haiku-4-5",
-            max_tokens=10,
+            max_tokens=200,
             messages=[{"role": "user", "content": prompt}],
         )
-        score = max(0, min(100, int(resp.content[0].text.strip())))
-        logger.info(f"[CLAUDE] {token_mint[:8]} scored {score}/100")
-        return score
+        raw    = resp.content[0].text.strip()
+        lines  = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+
+        score   = 70  # fail-open default
+        bullets: list[str] = []
+        for line in lines:
+            if line.upper().startswith("SCORE:"):
+                try:
+                    score = max(0, min(100, int(line.split(":", 1)[1].strip())))
+                except (ValueError, IndexError):
+                    pass
+            elif line.startswith("-"):
+                bullet = line.lstrip("- ").strip()
+                if bullet:
+                    bullets.append(bullet)
+                if len(bullets) >= 4:
+                    break
+
+        logger.info(f"[CLAUDE] {token_mint[:8]} scored {score}/100 | {len(bullets)} reason(s)")
+        return score, bullets
     except Exception as e:
         logger.warning(f"[CLAUDE] Scoring failed for {token_mint[:8]}: {e} — defaulting to 70")
-        return 70
+        return 70, None
 
 
 # --- Telegram message helpers -----------------------------------------
@@ -538,6 +566,44 @@ def _sol_price_from_dex(dex_pair: dict | None) -> float:
     except (ValueError, TypeError):
         pass
     return 0.0
+
+
+# --- Claude scoring Telegram alert ------------------------------------
+
+def _send_claude_score_alert(
+    token_label: str,
+    score: int,
+    bullets: list[str] | None,
+    approved: bool,
+    entry_blocked: bool,
+) -> None:
+    """
+    Send a Telegram notification with the Claude scoring result.
+
+    bullets=None  → API unavailable (fail-open path)
+    bullets=[]    → API returned a score but no bullet reasons
+    entry_blocked → True if the score caused the trade to be skipped
+    """
+    if bullets is None:
+        score_line = "Score: unavailable ⚠️"
+        bullet_block = ""
+        action_line = "<i>Proceeding with fail-open score.</i>"
+    else:
+        verdict = "✅ APPROVED" if approved else "❌ REJECTED"
+        score_line = f"Score: <b>{score}/100</b> {verdict}"
+        if bullets:
+            bullet_block = "\n" + "\n".join(f"  • {b}" for b in bullets)
+        else:
+            bullet_block = ""
+        action_line = "<i>Entry blocked.</i>" if entry_blocked else "<i>Proceeding with entry.</i>"
+
+    msg = (
+        f"🤖 <b>CLAUDE SCORE</b> — {token_label}\n"
+        f"{score_line}"
+        f"{bullet_block}\n"
+        f"{action_line}"
+    )
+    send_telegram(msg)
 
 
 # --- MANNOS tiered exit logic -----------------------------------------
@@ -692,11 +758,20 @@ async def dip_sniper_loop(
             )
 
             # Get Claude score
-            claude_score = await get_claude_score(
+            claude_score, score_bullets = await get_claude_score(
                 token_mint, pair, None,
                 f"dip sniper — {drop_pct:.0f}% drop from ATH of {ath:.6f} SOL"
             )
-            if claude_score < DIP_SNIPER_MIN_SCORE:
+            _dip_approved  = claude_score >= DIP_SNIPER_MIN_SCORE
+            _dip_label     = _token_label(token_mint, pair)
+            _send_claude_score_alert(
+                token_label=_dip_label,
+                score=claude_score,
+                bullets=score_bullets,
+                approved=_dip_approved,
+                entry_blocked=not _dip_approved,
+            )
+            if not _dip_approved:
                 logger.info(
                     f"[DIP SNIPER] {token_mint[:8]} | Claude score {claude_score} < "
                     f"{DIP_SNIPER_MIN_SCORE} — skipping re-entry"
@@ -1787,12 +1862,29 @@ async def poll_whale(
         # ----------------------------------------------------------------
 
         # --- Claude confidence scoring ---------------------------------
-        claude_score = await get_claude_score(
+        claude_score, score_bullets = await get_claude_score(
             token_mint,
             dex_pair,
             prebond_pct,   # None if not a pump.fun token or if graduated
             f"whale={name} signal, conviction={'high' if is_high_conviction else 'normal'}",
         )
+        _whale_approved = claude_score >= WHALE_MIN_SCORE
+        _whale_label    = _token_label(token_mint, dex_pair)
+        _send_claude_score_alert(
+            token_label=_whale_label,
+            score=claude_score,
+            bullets=score_bullets,
+            approved=_whale_approved,
+            entry_blocked=not _whale_approved,
+        )
+        if not _whale_approved:
+            logger.info(
+                f"[{name}] Claude score {claude_score} < {WHALE_MIN_SCORE} (WHALE_MIN_SCORE) "
+                f"— skipping entry for {token_mint[:8]}"
+            )
+            _token_blacklist.add(token_mint)
+            _save_blacklist()
+            continue
         tier = get_exit_tier(claude_score)
         logger.info(
             f"[{name}] Claude score: {claude_score}/100 | "
