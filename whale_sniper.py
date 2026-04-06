@@ -542,7 +542,7 @@ def _sol_price_from_dex(dex_pair: dict | None) -> float:
 
 # --- MANNOS tiered exit logic -----------------------------------------
 
-MANNOS_HARD_FLOOR_PCT = -20.0  # max loss before min target — protects against dumps
+MANNOS_HARD_FLOOR_PCT = -35.0  # max loss before min target — protects against dumps
 
 def get_exit_tier(claude_score: int) -> dict:
     """
@@ -1197,13 +1197,21 @@ async def emergency_dump_check(
     entry_sol   = pos["entry_sol"]
     pnl_pct     = (current_sol / entry_sol - 1) * 100 if entry_sol > 0 else 0.0
 
-    if pnl_pct > -EMERGENCY_DUMP_PCT:
-        logger.debug(f"[{token_mint[:8]}] emergency check OK — pnl={pnl_pct:+.1f}%")
+    # MANNOS gets a wider emergency floor (-40%) to ride out early volatility;
+    # all other wallets use the standard threshold (-5%).
+    _whale_name      = (pos.get("whale") or "").lower()
+    _emergency_floor = 40.0 if _whale_name == "mannos" else EMERGENCY_DUMP_PCT
+    logger.debug(
+        f"[{token_mint[:8]}] emergency check: using {_emergency_floor:.0f}% threshold "
+        f"({_whale_name.upper() if _whale_name else 'unknown'}) | pnl={pnl_pct:+.1f}%"
+    )
+
+    if pnl_pct > -_emergency_floor:
         return
 
     logger.info(
         f"[{token_mint[:8]}] IMMEDIATE DUMP DETECTED — "
-        f"emergency exit (pnl={pnl_pct:.1f}%)"
+        f"emergency exit (pnl={pnl_pct:.1f}%, threshold={_emergency_floor:.0f}%)"
     )
 
     if DRY_RUN:
