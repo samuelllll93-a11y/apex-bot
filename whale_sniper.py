@@ -2339,36 +2339,48 @@ async def poll_whale(
         # ----------------------------------------------------------------
 
         # --- Claude confidence scoring ---------------------------------
-        claude_score, score_bullets = await get_claude_score(
-            token_mint,
-            dex_pair,
-            prebond_pct,   # None if not a pump.fun token or if graduated
-            f"whale={name} signal, conviction={'high' if is_high_conviction else 'normal'}",
-        )
-        _whale_approved = claude_score >= WHALE_MIN_SCORE
-        _whale_label    = _token_label(token_mint, dex_pair)
-        _send_claude_score_alert(
-            token_label=_whale_label,
-            score=claude_score,
-            bullets=score_bullets,
-            approved=_whale_approved,
-            entry_blocked=not _whale_approved,
-        )
-        if not _whale_approved:
+        if MANNOS_AUTOPILOT and name == "mannos":
+            # Autopilot: skip scoring entirely — proceed straight to buy.
+            # Use fixed high-conviction tier: 200% min target, 25% trail, no time stop.
+            claude_score = 75   # maps to Tier 2 in get_exit_tier()
+            tier = get_exit_tier(claude_score)
             logger.info(
-                f"[{name}] Claude score {claude_score} < {WHALE_MIN_SCORE} (WHALE_MIN_SCORE) "
-                f"— skipping entry for {token_mint[:8]}"
+                f"[MANNOS AUTOPILOT] Claude score skipped — high-conviction tier: "
+                f"min_target={tier['min_target_pct']}% "
+                f"trail={tier['trail_pct']}% "
+                f"time={tier['time_stop_min']}m"
             )
-            _token_blacklist.add(token_mint)
-            _save_blacklist()
-            continue
-        tier = get_exit_tier(claude_score)
-        logger.info(
-            f"[{name}] Claude score: {claude_score}/100 | "
-            f"Tier: min_target={tier['min_target_pct']}% "
-            f"trail={tier['trail_pct']}% "
-            f"time={tier['time_stop_min']}m"
-        )
+        else:
+            claude_score, score_bullets = await get_claude_score(
+                token_mint,
+                dex_pair,
+                prebond_pct,   # None if not a pump.fun token or if graduated
+                f"whale={name} signal, conviction={'high' if is_high_conviction else 'normal'}",
+            )
+            _whale_approved = claude_score >= WHALE_MIN_SCORE
+            _whale_label    = _token_label(token_mint, dex_pair)
+            _send_claude_score_alert(
+                token_label=_whale_label,
+                score=claude_score,
+                bullets=score_bullets,
+                approved=_whale_approved,
+                entry_blocked=not _whale_approved,
+            )
+            if not _whale_approved:
+                logger.info(
+                    f"[{name}] Claude score {claude_score} < {WHALE_MIN_SCORE} "
+                    f"(WHALE_MIN_SCORE) — skipping entry for {token_mint[:8]}"
+                )
+                _token_blacklist[token_mint] = time.time() + BLACKLIST_MINUTES * 60
+                _save_blacklist()
+                continue
+            tier = get_exit_tier(claude_score)
+            logger.info(
+                f"[{name}] Claude score: {claude_score}/100 | "
+                f"Tier: min_target={tier['min_target_pct']}% "
+                f"trail={tier['trail_pct']}% "
+                f"time={tier['time_stop_min']}m"
+            )
         # ----------------------------------------------------------------
 
         # --- Position sizing — mr.putin > prebond > conviction > normal ---
