@@ -116,7 +116,7 @@ MRPUTIN_CONFIG: dict = {
 # --- Token safety check -----------------------------------------------
 MAX_TOP10_HOLDER_PCT = 35.0   # block if top 10 holders control > 35% of supply
 MAX_DEV_HOLDER_PCT   = 8.0    # warn threshold; hard block fires at 15%
-MAX_BUNDLE_WALLETS   = 5      # block if > 5 unique wallets signed in first 3 blocks
+MAX_BUNDLE_HOLD_PCT  = 40.0   # block if bundle wallets collectively hold > 40% of supply
 MIN_TX_COUNT         = 40     # warn (not block) if fewer than 40 txs seen
 
 # --- Dip sniper -------------------------------------------------------
@@ -320,6 +320,7 @@ async def check_token_safety(
     token_mint: str,
     helius_url: str,
     whale_name: str,
+    dex_pair: dict | None = None,
 ) -> tuple[bool, str]:
     """
     Run 4 concurrent safety checks on a token before entry.
@@ -328,8 +329,9 @@ async def check_token_safety(
       1. Top-holder concentration  — block if top 10 > MAX_TOP10_HOLDER_PCT (35%)
       2. Dev wallet holdings       — warn at MAX_DEV_HOLDER_PCT (8%), block at >15%;
                                      also block if mint authority not revoked
-      3. Bundle detection          — block if > MAX_BUNDLE_WALLETS (5) unique wallets
-                                     in the first 3 blocks after launch
+      3. Bundle detection          — identifies wallets that bought in the first 3
+                                     blocks, then fetches their current token balance;
+                                     block if they collectively hold > MAX_BUNDLE_HOLD_PCT (40%)
       4. Tx count (warn-only)      — warn if total sigs < MIN_TX_COUNT (40)
 
     Every individual check fails open: an API error silently skips that check.
@@ -345,6 +347,7 @@ async def check_token_safety(
     dev_blocks:      bool         = False
     mint_auth_block: bool         = False
     bundle_count:    int | None   = None
+    bundle_hold_pct: float | None = None
     tx_count:        int          = 0
 
     # ----------------------------------------------------------------
@@ -483,9 +486,14 @@ async def check_token_safety(
 
     # ----------------------------------------------------------------
     # Check 3+4 — bundle detection + tx count (shared API call)
+    #
+    # Bundle logic:
+    #   1. Identify wallets that signed transactions in the first 3 blocks
+    #   2. Fetch each bundle wallet's current token balance concurrently
+    #   3. BLOCK if their combined holding > MAX_BUNDLE_HOLD_PCT (40%)
     # ----------------------------------------------------------------
     async def _check_bundles_and_tx() -> None:
-        nonlocal bundle_count, tx_count
+        nonlocal bundle_count, bundle_hold_pct, tx_count
         try:
             sigs_resp = await _arpc_post(
                 session, helius_url,
@@ -497,7 +505,8 @@ async def check_token_safety(
             logger.info(f"[{token_mint[:8]}] Tx count (sample): {tx_count}")
 
             if not sigs:
-                bundle_count = 0
+                bundle_count    = 0
+                bundle_hold_pct = 0.0
                 return
 
             # Oldest 3 unique slots = launch blocks
@@ -548,9 +557,57 @@ async def check_token_safety(
                     pass   # fail-open per individual tx
 
             bundle_count = len(unique_signers)
+
+            if not unique_signers:
+                bundle_hold_pct = 0.0
+                return
+
+            # Fetch total supply independently (don't share with _check_holders
+            # — they run concurrently and may not have completed yet)
+            supply_resp = await _arpc_post(
+                session, helius_url,
+                "getTokenSupply",
+                [token_mint, {"commitment": "confirmed"}],
+            )
+            total = float(
+                ((supply_resp.get("result") or {}).get("value") or {}).get("uiAmount") or 0
+            )
+            if total <= 0:
+                return
+
+            # Fetch current token balance for each bundle wallet concurrently
+            async def _wallet_balance(wallet: str) -> float:
+                try:
+                    resp = await _arpc_post(
+                        session, helius_url,
+                        "getTokenAccountsByOwner",
+                        [
+                            wallet,
+                            {"mint": token_mint},
+                            {"encoding": "jsonParsed", "commitment": "confirmed"},
+                        ],
+                    )
+                    accts = (resp.get("result") or {}).get("value") or []
+                    bal = 0.0
+                    for acct in accts:
+                        info = (
+                            (acct.get("account") or {})
+                            .get("data", {})
+                            .get("parsed", {})
+                            .get("info", {})
+                        )
+                        bal += float((info.get("tokenAmount") or {}).get("uiAmount") or 0)
+                    return bal
+                except Exception:
+                    return 0.0   # fail-open per wallet
+
+            balances        = await asyncio.gather(*[_wallet_balance(w) for w in unique_signers])
+            bundle_hold_tot = sum(balances)
+            bundle_hold_pct = (bundle_hold_tot / total) * 100
+
             logger.info(
-                f"[{token_mint[:8]}] Bundle check: {bundle_count} unique wallet(s) "
-                f"in first {len(first_slots)} block(s)"
+                f"[{token_mint[:8]}] Bundle check: {bundle_count} wallet(s) in first "
+                f"{len(first_slots)} block(s) — hold {bundle_hold_pct:.1f}% of supply"
             )
         except Exception as e:
             logger.debug(f"[{token_mint[:8]}] bundle check skipped: {e}")
@@ -580,15 +637,17 @@ async def check_token_safety(
         holder_line  = f"Holders: top 10 = {holder_pct:.0f}% ✅"
         holder_block = False
 
-    # Bundle status
-    if bundle_count is None:
-        bundle_line  = "Bundles: unknown ⚠️"
+    # Bundle status — show wallet count + hold% regardless of pass/fail
+    _bcount = bundle_count if bundle_count is not None else "?"
+    _bpct   = f"{bundle_hold_pct:.0f}%" if bundle_hold_pct is not None else "?%"
+    if bundle_hold_pct is None:
+        bundle_line  = f"Bundles: {_bcount} wallets in first 3 blocks — held {_bpct} of supply ⚠️"
         bundle_block = False   # fail-open
-    elif bundle_count > MAX_BUNDLE_WALLETS:
-        bundle_line  = f"Bundles: {bundle_count} wallets in first 3 blocks 🚨"
+    elif bundle_hold_pct > MAX_BUNDLE_HOLD_PCT:
+        bundle_line  = f"Bundles: {_bcount} wallets in first 3 blocks — held {_bpct} of supply 🚨"
         bundle_block = True
     else:
-        bundle_line  = f"Bundles: {bundle_count} wallets in first 3 blocks ✅"
+        bundle_line  = f"Bundles: {_bcount} wallets in first 3 blocks — held {_bpct} of supply ✅"
         bundle_block = False
 
     # Tx count (warn-only)
@@ -605,21 +664,24 @@ async def check_token_safety(
     if holder_block:
         block_reasons.append(f"top 10 holders = {holder_pct:.0f}%")
     if bundle_block:
-        block_reasons.append(f"bundle: {bundle_count} wallets in launch blocks")
+        block_reasons.append(f"bundle wallets hold {bundle_hold_pct:.0f}% of supply")
 
     is_safe = len(block_reasons) == 0
 
     # ----------------------------------------------------------------
     # Telegram notification
     # ----------------------------------------------------------------
+    token_name = ((dex_pair or {}).get("baseToken") or {}).get("name") or "Unknown"
     verdict_line = (
         "✅ PASSED — proceeding to Claude score"
         if is_safe
         else f"❌ BLOCKED — {', '.join(block_reasons)}"
     )
     send_telegram(
-        f"🔍 <b>SAFETY CHECK</b> — {token_mint[:8]}\n"
-        f"  {dev_status}\n"
+        f"🔍 <b>SAFETY CHECK</b>\n"
+        f"\n{token_name}\n"
+        f"<code>{token_mint}</code>\n"
+        f"\n  {dev_status}\n"
         f"  {holder_line}\n"
         f"  {bundle_line}\n"
         f"  {tx_line}\n"
@@ -639,7 +701,7 @@ async def check_token_safety(
         f"[{token_mint[:8]}] Safety: "
         f"dev={dev_log}, "
         f"holders={'unknown' if holder_pct is None else f'{holder_pct:.0f}%'}, "
-        f"bundles={'unknown' if bundle_count is None else bundle_count}, "
+        f"bundles={'unknown' if bundle_hold_pct is None else f'{bundle_hold_pct:.0f}%'}, "
         f"txs={tx_count} {result_icon}"
     )
 
@@ -2347,7 +2409,7 @@ async def poll_whale(
         # Skip for mannos (MANNOS_AUTOPILOT) and mr.putin (sub-$5k, no clean data)
         if not (MANNOS_AUTOPILOT and name == "mannos") and name != "mr.putin":
             _safe, _block_reason = await check_token_safety(
-                session, token_mint, rpc_url, name
+                session, token_mint, rpc_url, name, dex_pair=dex_pair
             )
             if not _safe:
                 logger.info(
