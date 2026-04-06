@@ -84,7 +84,7 @@ TIME_STOP_MIN      = int(os.getenv("TIME_STOP_MIN", "30"))  # minutes
 POSITION_CHECK_SEC = 10     # how often the sell monitor loop runs
 
 # --- Emergency exit parameters ----------------------------------------
-EMERGENCY_DUMP_PCT        = 5.0  # emergency exit if down >5% right after buy
+EMERGENCY_DUMP_PCT        = 40.0  # emergency exit if down >40% right after buy
 EMERGENCY_CHECK_DELAY_SEC = 5    # seconds after buy before emergency check runs
 
 # --- DexScreener quality filter ---------------------------------------
@@ -107,7 +107,7 @@ MRPUTIN_CONFIG: dict = {
     "max_mcap_usd":      5_000,   # Skip if mcap > $5k at signal time
     "bypass_dexscreener": True,
     "position_size_pct": 0.01,   # 1% of current SOL balance
-    "hard_floor_pct":    -20.0,  # Stop loss from entry
+    "hard_floor_pct":    -35.0,  # Stop loss from entry
     "trail_pct":         20.0,   # Trailing stop from peak
     "min_hold_mins":     120,    # Never sell before 2 hours
     "time_stop_mins":    4_320,  # Force exit after 3 days (3×24×60)
@@ -995,7 +995,7 @@ def _mannos_exit_check(
     Returns an exit reason string, or None if position should be held.
 
     Before min_target_hit:
-      - Hard floor at MANNOS_HARD_FLOOR_PCT (-20%) from entry
+      - Hard floor at MANNOS_HARD_FLOOR_PCT (-35%) from entry
       - Time stop at tier["time_stop_min"] (skipped if None — Tier 2/3)
 
     After min_target_hit:
@@ -1738,21 +1738,17 @@ async def emergency_dump_check(
     entry_sol   = pos["entry_sol"]
     pnl_pct     = (current_sol / entry_sol - 1) * 100 if entry_sol > 0 else 0.0
 
-    # MANNOS gets a wider emergency floor (-40%) to ride out early volatility;
-    # all other wallets use the standard threshold (-5%).
-    _whale_name      = (pos.get("whale") or "").lower()
-    _emergency_floor = 40.0 if _whale_name == "mannos" else EMERGENCY_DUMP_PCT
     logger.debug(
-        f"[{token_mint[:8]}] emergency check: using {_emergency_floor:.0f}% threshold "
-        f"({_whale_name.upper() if _whale_name else 'unknown'}) | pnl={pnl_pct:+.1f}%"
+        f"[{token_mint[:8]}] emergency check: threshold={EMERGENCY_DUMP_PCT:.0f}% "
+        f"| pnl={pnl_pct:+.1f}%"
     )
 
-    if pnl_pct > -_emergency_floor:
+    if pnl_pct > -EMERGENCY_DUMP_PCT:
         return
 
     logger.info(
         f"[{token_mint[:8]}] IMMEDIATE DUMP DETECTED — "
-        f"emergency exit (pnl={pnl_pct:.1f}%, threshold={_emergency_floor:.0f}%)"
+        f"emergency exit (pnl={pnl_pct:.1f}%, threshold={EMERGENCY_DUMP_PCT:.0f}%)"
     )
 
     if DRY_RUN:
