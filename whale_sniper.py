@@ -1280,16 +1280,22 @@ async def get_jupiter_quote(
         "amount":      str(amount_lamports),
         "slippageBps": str(MAX_SLIPPAGE_BPS),
     }
-    url = f"{JUPITER_API}/quote"
+    url    = f"{JUPITER_API}/quote"
+    delays = [5, 10]   # wait longer between retries — gives Jupiter time to index new tokens
     for attempt in range(3):
+        body = ""
         try:
             async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                body = await resp.text()
                 resp.raise_for_status()
-                return await resp.json()
+                return json.loads(body)
         except Exception as e:
-            logger.error(f"Jupiter quote attempt {attempt + 1}/3 failed: {e}")
+            logger.error(
+                f"Jupiter quote attempt {attempt + 1}/3 failed: {e} "
+                f"| response: {body[:300]}"
+            )
             if attempt < 2:
-                await asyncio.sleep(2)
+                await asyncio.sleep(delays[attempt])
     return None
 
 
@@ -1397,13 +1403,18 @@ async def execute_swap(
     url  = f"{JUPITER_API}/swap"
     txid = None
     for attempt in range(3):
+        body = ""
         try:
             async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                body = await resp.text()
                 resp.raise_for_status()
-                txid = (await resp.json()).get("txid")
+                txid = json.loads(body).get("txid")
                 break   # submission accepted — move to confirmation
         except Exception as e:
-            logger.error(f"Jupiter swap attempt {attempt + 1}/3 failed: {e}")
+            logger.error(
+                f"Jupiter swap attempt {attempt + 1}/3 failed: {e} "
+                f"| response: {body[:300]}"
+            )
             if attempt < 2:
                 await asyncio.sleep(2)
 
