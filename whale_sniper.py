@@ -2263,7 +2263,14 @@ async def poll_whale(
         logger.info(f"[{name}] Balance OK: {sol_balance:.4f} SOL (min={LOW_BALANCE_SOL} SOL)")
         # ----------------------------------------------------------------
 
-        # --- DexScreener quality check — Fix 2 -------------------------
+        # --- Pump.fun status (prefetch — used by DexScreener gate AND prebond logic) ---
+        # Fetching once here avoids a duplicate API call later.
+        # Fail-open: (None, False) means pump.fun unreachable or token not on pump.fun.
+        prebond_pct, is_graduated = await fetch_prebond_progress(session, token_mint)
+        prebond_buy_sol: float | None = None  # set to override BUY_AMOUNT_SOL for prebond entries
+        # ----------------------------------------------------------------
+
+        # --- DexScreener quality check ---------------------------------
         if (MANNOS_AUTOPILOT and name == "mannos") or name == "mr.putin":
             logger.info(
                 f"[{name.upper()} AUTOPILOT] Bypassing DexScreener — direct entry "
@@ -2276,6 +2283,13 @@ async def poll_whale(
                 logger.warning(
                     f"[{name}] DexScreener unavailable for {token_mint[:8]} "
                     f"— proceeding (fail-open)"
+                )
+            elif prebond_pct is not None and not is_graduated:
+                # Active bonding curve: token has no AMM pool yet so DexScreener
+                # liquidity/volume will be $0 — quality check would always block it.
+                logger.info(
+                    f"[{name}] Prebond token detected — skipping DexScreener quality check "
+                    f"({token_mint[:8]})"
                 )
             else:
                 dex_ok, dex_reason = passes_dex_quality(dex_pair)
@@ -2306,9 +2320,7 @@ async def poll_whale(
         # ----------------------------------------------------------------
 
         # --- PumpFun prebond check -------------------------------------
-        prebond_pct, is_graduated = await fetch_prebond_progress(session, token_mint)
-        prebond_buy_sol: float | None = None  # set to override BUY_AMOUNT_SOL for prebond entries
-
+        # prebond_pct and is_graduated were already fetched above — no second API call.
         if prebond_pct is None:
             # PumpFun API unreachable — not a pump.fun token or API down — fail-open
             logger.debug(f"[PREBOND] No pump.fun data for {token_mint[:8]} — proceeding normally")
