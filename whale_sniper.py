@@ -124,6 +124,10 @@ DIP_SNIPER_CHECK_SEC     = 60     # how often the dip sniper loop runs
 # mint → {graduation_price_sol: float, ath_sol: float, added_ts: float}
 graduated_watchlist: dict[str, dict] = {}
 
+# Persistence paths — both files live next to the script
+POSITIONS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "open_positions.json")
+BLACKLIST_FILE  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "blacklist.json")
+
 # Open positions: token_mint → position dict (populated after every buy)
 open_positions: dict[str, dict] = {}
 
@@ -375,6 +379,54 @@ def _save_graduated_watchlist(
             json.dump(watchlist, f, indent=2)
     except Exception as e:
         logger.warning(f"[DIP SNIPER] Could not save watchlist to {path}: {e}")
+
+
+# --- Position + blacklist persistence ------------------------------------
+
+def _save_positions() -> None:
+    """Atomically persist open_positions to disk (temp-file + os.replace)."""
+    tmp = POSITIONS_FILE + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            json.dump(open_positions, f, indent=2)
+        os.replace(tmp, POSITIONS_FILE)
+    except Exception as e:
+        logger.warning(f"[PERSIST] Could not save positions: {e}")
+
+
+def _load_positions() -> dict:
+    """Load open_positions from disk. Returns {{}} on missing file or parse error."""
+    try:
+        with open(POSITIONS_FILE, "r") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        logger.warning(f"[PERSIST] Could not load positions from {POSITIONS_FILE}: {e}")
+        return {}
+
+
+def _save_blacklist() -> None:
+    """Atomically persist _token_blacklist to disk (temp-file + os.replace)."""
+    tmp = BLACKLIST_FILE + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            json.dump(_token_blacklist, f, indent=2)
+        os.replace(tmp, BLACKLIST_FILE)
+    except Exception as e:
+        logger.warning(f"[PERSIST] Could not save blacklist: {e}")
+
+
+def _load_blacklist() -> dict:
+    """Load _token_blacklist from disk. Returns {{}} on missing file or parse error."""
+    try:
+        with open(BLACKLIST_FILE, "r") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        logger.warning(f"[PERSIST] Could not load blacklist from {BLACKLIST_FILE}: {e}")
+        return {}
 
 
 def _add_to_graduated_watchlist(token_mint: str, graduation_price_sol: float) -> None:
@@ -691,6 +743,7 @@ async def dip_sniper_loop(
                     "min_target_hit": False,
                     "source":         "dip_sniper",
                 }
+                _save_positions()
                 _stats["trades_executed"] += 1
                 logger.info(
                     f"[DIP SNIPER] {token_mint[:8]} | Entered {token_units:,} tokens "
@@ -998,6 +1051,7 @@ async def check_and_maybe_exit(
     if current_sol > peak_sol:
         open_positions[token_mint]["peak_sol"] = current_sol
         peak_sol = current_sol
+        _save_positions()
 
     pnl_pct       = (current_sol / entry_sol - 1) * 100 if entry_sol > 0 else 0.0
     drop_from_peak = (current_sol / peak_sol  - 1) * 100 if peak_sol  > 0 else 0.0
@@ -1016,6 +1070,7 @@ async def check_and_maybe_exit(
     if not min_target_hit and pnl_pct >= tier["min_target_pct"]:
         open_positions[token_mint]["min_target_hit"] = True
         min_target_hit = True
+        _save_positions()
         logger.info(
             f"[EXIT] {token_mint[:8]} | Min target {tier['min_target_pct']}% reached | "
             f"Trail {tier['trail_pct']}% now active | Confidence tier: {claude_score}"
@@ -1073,10 +1128,12 @@ async def check_and_maybe_exit(
 
     # Remove from open_positions *before* logging so monitor doesn't re-enter
     del open_positions[token_mint]
+    _save_positions()
 
     # Blacklist on trailing stop ONLY — take profit and time stop allow re-entry
     if exit_reason.startswith("TRAILING STOP"):
         _token_blacklist[token_mint] = time.time() + BLACKLIST_MINUTES * 60
+        _save_blacklist()
         logger.info(
             f"[{token_mint[:8]}] Blacklisted for {BLACKLIST_MINUTES}min "
             f"(trailing stop loss — will not re-enter until cooldown expires)"
@@ -1165,7 +1222,9 @@ async def emergency_dump_check(
             return
 
     del open_positions[token_mint]
+    _save_positions()
     _token_blacklist[token_mint] = time.time() + BLACKLIST_MINUTES * 60
+    _save_blacklist()
     logger.info(f"[{token_mint[:8]}] Blacklisted {BLACKLIST_MINUTES}min after emergency exit")
 
     _stats["losses"]      += 1
@@ -1859,6 +1918,7 @@ async def poll_whale(
                 "mc_entry":      mc_entry,
                 "token_label":   token_label,
             }
+            _save_positions()
             logger.info(
                 f"[{token_mint[:8]}] Position opened — "
                 f"{token_units:,} tokens | entry {entry_sol:.4f} SOL"
@@ -1926,7 +1986,16 @@ async def run():
 
     _register_commands()
     startup_checks(rpc_url, wallet_pubkey)
-    logger.info(f"Position monitor: {len(open_positions)} open position(s) at startup")
+
+    # Restore persisted state from disk
+    _restored_positions = _load_positions()
+    open_positions.update(_restored_positions)
+    logger.info(f"Position monitor: {len(open_positions)} open position(s) at startup "
+                f"({'restored from disk' if _restored_positions else 'none'})")
+
+    _restored_blacklist = _load_blacklist()
+    _token_blacklist.update(_restored_blacklist)
+
     now_ts = time.time()
     active_bl = {m: exp for m, exp in _token_blacklist.items() if exp > now_ts}
     if not active_bl:
