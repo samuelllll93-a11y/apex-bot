@@ -113,6 +113,12 @@ MRPUTIN_CONFIG: dict = {
     "time_stop_mins":    4_320,  # Force exit after 3 days (3×24×60)
 }
 
+# --- Token safety check -----------------------------------------------
+MAX_TOP10_HOLDER_PCT = 35.0   # block if top 10 holders control > 35% of supply
+MAX_DEV_HOLDER_PCT   = 8.0    # warn threshold; hard block fires at 15%
+MAX_BUNDLE_WALLETS   = 5      # block if > 5 unique wallets signed in first 3 blocks
+MIN_TX_COUNT         = 40     # warn (not block) if fewer than 40 txs seen
+
 # --- Dip sniper -------------------------------------------------------
 GRADUATED_WATCHLIST_PATH = "data/graduated_watchlist.json"
 DIP_SNIPER_DROP_PCT      = 50.0   # trigger re-entry if price drops X% from ATH
@@ -146,6 +152,7 @@ _stats: dict = {
     "signals_detected":       0,   # every whale buy signal seen
     "cancelled_dexscreener":  0,   # filtered by liquidity / volume check
     "cancelled_prebond":      0,   # filtered by PumpFun bonding curve check
+    "cancelled_safety":       0,   # blocked by token safety check
     "trades_executed":        0,   # buys that confirmed on-chain
     "wins":                   0,   # closed positions with PnL >= 0
     "losses":                 0,   # closed positions with PnL < 0
@@ -194,6 +201,22 @@ def rpc_post(rpc_url: str, method: str, params: list) -> dict:
     resp = requests.post(rpc_url, json=payload, timeout=10)
     resp.raise_for_status()
     return resp.json()
+
+
+async def _arpc_post(
+    session: aiohttp.ClientSession,
+    rpc_url: str,
+    method: str,
+    params: list | dict,
+) -> dict:
+    """Async JSON-RPC POST with Helius call tracking. Raises on HTTP errors."""
+    _track_helius_call()
+    payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
+    async with session.post(
+        rpc_url, json=payload, timeout=aiohttp.ClientTimeout(total=10)
+    ) as resp:
+        resp.raise_for_status()
+        return await resp.json()
 
 
 def get_recent_signatures(rpc_url: str, wallet: str, limit: int = 10) -> list[dict]:
@@ -287,6 +310,339 @@ def passes_dex_quality(pair_data: dict) -> tuple[bool, str]:
     if v5m < MIN_DEX_5M_VOLUME_USD:
         return False, f"5m vol ${v5m:,.0f} below ${MIN_DEX_5M_VOLUME_USD:,}"
     return True, f"liq=${liq:,.0f} 5m_vol=${v5m:,.0f}"
+
+
+# --- Token safety check -----------------------------------------------
+
+async def check_token_safety(
+    session: aiohttp.ClientSession,
+    token_mint: str,
+    helius_url: str,
+    whale_name: str,
+) -> tuple[bool, str]:
+    """
+    Run 4 concurrent safety checks on a token before entry.
+
+    Checks (all run via asyncio.gather):
+      1. Top-holder concentration  — block if top 10 > MAX_TOP10_HOLDER_PCT (35%)
+      2. Dev wallet holdings       — warn at MAX_DEV_HOLDER_PCT (8%), block at >15%;
+                                     also block if mint authority not revoked
+      3. Bundle detection          — block if > MAX_BUNDLE_WALLETS (5) unique wallets
+                                     in the first 3 blocks after launch
+      4. Tx count (warn-only)      — warn if total sigs < MIN_TX_COUNT (40)
+
+    Every individual check fails open: an API error silently skips that check.
+    Returns (safe, block_reason). safe=True → proceed with entry.
+    Sends a Telegram notification with the full result card.
+    """
+    _DEV_HARD_BLOCK_PCT = 15.0   # hard block threshold; 8-15% warns but allows
+
+    # Mutable result holders (written by inner coroutines via nonlocal)
+    holder_pct:      float | None = None
+    dev_pct:         float | None = None
+    dev_status:      str          = "Dev wallet unknown"
+    dev_blocks:      bool         = False
+    mint_auth_block: bool         = False
+    bundle_count:    int | None   = None
+    tx_count:        int          = 0
+
+    # ----------------------------------------------------------------
+    # Check 1 — top-holder concentration
+    # ----------------------------------------------------------------
+    async def _check_holders() -> None:
+        nonlocal holder_pct
+        try:
+            accts_resp = await _arpc_post(
+                session, helius_url,
+                "getTokenLargestAccounts",
+                [token_mint, {"commitment": "confirmed"}],
+            )
+            holders = (accts_resp.get("result") or {}).get("value") or []
+            if not holders:
+                return
+
+            supply_resp = await _arpc_post(
+                session, helius_url,
+                "getTokenSupply",
+                [token_mint, {"commitment": "confirmed"}],
+            )
+            total = float(
+                ((supply_resp.get("result") or {}).get("value") or {}).get("uiAmount") or 0
+            )
+            if total <= 0:
+                return
+
+            top10 = sorted(
+                holders, key=lambda h: float(h.get("uiAmount") or 0), reverse=True
+            )[:10]
+            top10_sum = sum(float(h.get("uiAmount") or 0) for h in top10)
+            holder_pct = (top10_sum / total) * 100
+            logger.info(
+                f"[{token_mint[:8]}] Holder concentration: top 10 = {holder_pct:.1f}%"
+            )
+        except Exception as e:
+            logger.debug(f"[{token_mint[:8]}] holder check skipped: {e}")
+
+    # ----------------------------------------------------------------
+    # Check 2 — dev wallet holdings + mint authority
+    # ----------------------------------------------------------------
+    async def _check_dev() -> None:
+        nonlocal dev_pct, dev_status, dev_blocks, mint_auth_block
+        try:
+            # Creator address via Helius DAS getAsset
+            asset_resp = await _arpc_post(
+                session, helius_url,
+                "getAsset",
+                {"id": token_mint},
+            )
+            asset = asset_resp.get("result") or {}
+
+            creator_addr: str | None = None
+            creators = asset.get("creators") or []
+            if creators:
+                verified     = [c for c in creators if c.get("verified")]
+                best         = verified[0] if verified else creators[0]
+                creator_addr = best.get("address")
+            if not creator_addr:
+                creator_addr = asset.get("update_authority") or None
+            if not creator_addr:
+                auths = asset.get("authorities") or []
+                if auths:
+                    creator_addr = auths[0].get("address")
+
+            if creator_addr:
+                tok_resp = await _arpc_post(
+                    session, helius_url,
+                    "getTokenAccountsByOwner",
+                    [
+                        creator_addr,
+                        {"mint": token_mint},
+                        {"encoding": "jsonParsed", "commitment": "confirmed"},
+                    ],
+                )
+                tok_accts = (tok_resp.get("result") or {}).get("value") or []
+                dev_bal = 0.0
+                for acct in tok_accts:
+                    info = (
+                        (acct.get("account") or {})
+                        .get("data", {})
+                        .get("parsed", {})
+                        .get("info", {})
+                    )
+                    dev_bal += float(
+                        (info.get("tokenAmount") or {}).get("uiAmount") or 0
+                    )
+
+                supply_resp = await _arpc_post(
+                    session, helius_url,
+                    "getTokenSupply",
+                    [token_mint, {"commitment": "confirmed"}],
+                )
+                total = float(
+                    ((supply_resp.get("result") or {}).get("value") or {}).get(
+                        "uiAmount"
+                    ) or 0
+                )
+                if total > 0:
+                    dev_pct = (dev_bal / total) * 100
+                    if dev_pct <= 1.0:
+                        dev_status = "Dev fully out ✅"
+                        dev_blocks = False
+                    elif dev_pct <= _DEV_HARD_BLOCK_PCT:
+                        dev_status = f"Dev holds {dev_pct:.1f}% ⚠️"
+                        dev_blocks = False
+                    else:
+                        dev_status = f"Dev holds {dev_pct:.1f}% 🚨 BLOCK"
+                        dev_blocks = True
+                    logger.info(f"[{token_mint[:8]}] {dev_status}")
+                else:
+                    dev_status = "Dev wallet unknown"
+
+            # Mint authority check via getAccountInfo
+            acct_resp = await _arpc_post(
+                session, helius_url,
+                "getAccountInfo",
+                [token_mint, {"encoding": "jsonParsed", "commitment": "confirmed"}],
+            )
+            acct_data = (
+                ((acct_resp.get("result") or {}).get("value") or {}).get("data") or {}
+            )
+            if isinstance(acct_data, dict):
+                parsed_info = acct_data.get("parsed", {}).get("info") or {}
+                mint_auth   = parsed_info.get("mintAuthority")
+                if mint_auth is not None:
+                    mint_auth_block = True
+                    logger.warning(
+                        f"[{token_mint[:8]}] Mint authority ACTIVE: {mint_auth} 🚨"
+                    )
+                else:
+                    logger.info(f"[{token_mint[:8]}] Mint authority revoked ✅")
+        except Exception as e:
+            logger.debug(f"[{token_mint[:8]}] dev check skipped: {e}")
+
+    # ----------------------------------------------------------------
+    # Check 3+4 — bundle detection + tx count (shared API call)
+    # ----------------------------------------------------------------
+    async def _check_bundles_and_tx() -> None:
+        nonlocal bundle_count, tx_count
+        try:
+            sigs_resp = await _arpc_post(
+                session, helius_url,
+                "getSignaturesForAddress",
+                [token_mint, {"limit": 40, "commitment": "confirmed"}],
+            )
+            sigs     = sigs_resp.get("result") or []
+            tx_count = len(sigs)
+            logger.info(f"[{token_mint[:8]}] Tx count (sample): {tx_count}")
+
+            if not sigs:
+                bundle_count = 0
+                return
+
+            # Oldest 3 unique slots = launch blocks
+            first_slots: list[int] = []
+            for s in reversed(sigs):
+                slot = s.get("slot")
+                if slot is not None and slot not in first_slots:
+                    first_slots.append(slot)
+                if len(first_slots) >= 3:
+                    break
+
+            first_slot_set = set(first_slots)
+            early_sigs = [
+                s["signature"]
+                for s in sigs
+                if s.get("slot") in first_slot_set and s.get("signature")
+            ][:10]   # cap fetches at 10 getTransaction calls
+
+            unique_signers: set[str] = set()
+            for sig in early_sigs:
+                try:
+                    tx_resp = await _arpc_post(
+                        session, helius_url,
+                        "getTransaction",
+                        [
+                            sig,
+                            {
+                                "encoding": "jsonParsed",
+                                "commitment": "confirmed",
+                                "maxSupportedTransactionVersion": 0,
+                            },
+                        ],
+                    )
+                    acct_keys = (
+                        ((tx_resp.get("result") or {}).get("transaction") or {})
+                        .get("message", {})
+                        .get("accountKeys") or []
+                    )
+                    if acct_keys:
+                        first_key = acct_keys[0]
+                        fee_payer = (
+                            first_key if isinstance(first_key, str)
+                            else first_key.get("pubkey", "")
+                        )
+                        if fee_payer:
+                            unique_signers.add(fee_payer)
+                except Exception:
+                    pass   # fail-open per individual tx
+
+            bundle_count = len(unique_signers)
+            logger.info(
+                f"[{token_mint[:8]}] Bundle check: {bundle_count} unique wallet(s) "
+                f"in first {len(first_slots)} block(s)"
+            )
+        except Exception as e:
+            logger.debug(f"[{token_mint[:8]}] bundle check skipped: {e}")
+
+    # ----------------------------------------------------------------
+    # Run all checks concurrently
+    # ----------------------------------------------------------------
+    await asyncio.gather(
+        _check_holders(),
+        _check_dev(),
+        _check_bundles_and_tx(),
+        return_exceptions=True,
+    )
+
+    # ----------------------------------------------------------------
+    # Build per-line status strings
+    # ----------------------------------------------------------------
+
+    # Holder status
+    if holder_pct is None:
+        holder_line  = "Holders: unknown ⚠️"
+        holder_block = False   # fail-open
+    elif holder_pct > MAX_TOP10_HOLDER_PCT:
+        holder_line  = f"Holders: top 10 = {holder_pct:.0f}% 🚨"
+        holder_block = True
+    else:
+        holder_line  = f"Holders: top 10 = {holder_pct:.0f}% ✅"
+        holder_block = False
+
+    # Bundle status
+    if bundle_count is None:
+        bundle_line  = "Bundles: unknown ⚠️"
+        bundle_block = False   # fail-open
+    elif bundle_count > MAX_BUNDLE_WALLETS:
+        bundle_line  = f"Bundles: {bundle_count} wallets in first 3 blocks 🚨"
+        bundle_block = True
+    else:
+        bundle_line  = f"Bundles: {bundle_count} wallets in first 3 blocks ✅"
+        bundle_block = False
+
+    # Tx count (warn-only)
+    tx_line = f"Txs: {tx_count} ✅" if tx_count >= MIN_TX_COUNT else f"Txs: {tx_count} ⚠️"
+
+    # ----------------------------------------------------------------
+    # Collect block reasons
+    # ----------------------------------------------------------------
+    block_reasons: list[str] = []
+    if dev_blocks:
+        block_reasons.append(f"dev holds {dev_pct:.0f}% of supply")
+    if mint_auth_block:
+        block_reasons.append("mint authority not revoked")
+    if holder_block:
+        block_reasons.append(f"top 10 holders = {holder_pct:.0f}%")
+    if bundle_block:
+        block_reasons.append(f"bundle: {bundle_count} wallets in launch blocks")
+
+    is_safe = len(block_reasons) == 0
+
+    # ----------------------------------------------------------------
+    # Telegram notification
+    # ----------------------------------------------------------------
+    verdict_line = (
+        "✅ PASSED — proceeding to Claude score"
+        if is_safe
+        else f"❌ BLOCKED — {', '.join(block_reasons)}"
+    )
+    send_telegram(
+        f"🔍 <b>SAFETY CHECK</b> — {token_mint[:8]}\n"
+        f"  {dev_status}\n"
+        f"  {holder_line}\n"
+        f"  {bundle_line}\n"
+        f"  {tx_line}\n"
+        f"\n{verdict_line}"
+    )
+
+    # ----------------------------------------------------------------
+    # Log summary line
+    # ----------------------------------------------------------------
+    dev_log     = (
+        "out"              if "fully out" in dev_status
+        else f"{dev_pct:.0f}%" if dev_pct is not None
+        else "unknown"
+    )
+    result_icon = "✅" if is_safe else "❌"
+    logger.info(
+        f"[{token_mint[:8]}] Safety: "
+        f"dev={dev_log}, "
+        f"holders={'unknown' if holder_pct is None else f'{holder_pct:.0f}%'}, "
+        f"bundles={'unknown' if bundle_count is None else bundle_count}, "
+        f"txs={tx_count} {result_icon}"
+    )
+
+    return is_safe, "; ".join(block_reasons)
 
 
 # --- PumpFun prebond layer --------------------------------------------
@@ -1849,6 +2205,28 @@ async def poll_whale(
             logger.info(
                 f"[PREBOND] Curve: {prebond_pct:.0f}% | Score: {pb_score} | "
                 f"Position: 2% ({prebond_buy_sol} SOL) | Action: PROCEED"
+            )
+        # ----------------------------------------------------------------
+
+        # --- Token safety check ----------------------------------------
+        # Skip for mannos (MANNOS_AUTOPILOT) and mr.putin (sub-$5k, no clean data)
+        if not (MANNOS_AUTOPILOT and name == "mannos") and name != "mr.putin":
+            _safe, _block_reason = await check_token_safety(
+                session, token_mint, rpc_url, name
+            )
+            if not _safe:
+                logger.info(
+                    f"[{name}] SKIP — safety check failed: {_block_reason} "
+                    f"({token_mint[:8]})"
+                )
+                _stats["cancelled_safety"] += 1
+                _token_blacklist[token_mint] = time.time() + BLACKLIST_MINUTES * 60
+                _save_blacklist()
+                continue
+        else:
+            logger.info(
+                f"[{name.upper()}] Safety check skipped "
+                f"({'MANNOS_AUTOPILOT' if name == 'mannos' else 'mr.putin sub-$5k'})"
             )
         # ----------------------------------------------------------------
 
