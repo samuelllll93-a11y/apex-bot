@@ -154,6 +154,7 @@ _stats: dict = {
     "cancelled_prebond":      0,   # filtered by PumpFun bonding curve check
     "cancelled_safety":       0,   # blocked by token safety check
     "trades_executed":        0,   # buys that confirmed on-chain
+    "tp1_partials_executed":  0,   # successful TP1 partial sells at 2x
     "wins":                   0,   # closed positions with PnL >= 0
     "losses":                 0,   # closed positions with PnL < 0
     "net_pnl_sol":            0.0, # running sum of (exit_sol - entry_sol)
@@ -1496,6 +1497,104 @@ async def check_and_maybe_exit(
     claude_score   = pos.get("claude_score", 70)
     min_target_hit = pos.get("min_target_hit", False)
     tier           = get_exit_tier(claude_score)
+
+    # --- TP1 partial sell at 2x -------------------------------------------
+    # Fires once when the position hits 100% gain and has not yet had a
+    # partial sell.  Sells TAKE_PROFIT_PCT of the token balance, records the
+    # SOL received, reduces amount_tokens, and recalibrates entry/peak so the
+    # remaining holding is effectively a free ride.  Fail-open: if the swap
+    # fails, min_target_hit is still set and the full position continues under
+    # trailing-stop logic on the next tick.
+    if not min_target_hit and pnl_pct >= 100.0:
+        _tp1_label    = pos.get("token_label") or token_mint[:8]
+        _sell_frac    = TAKE_PROFIT_PCT / 100.0          # e.g. 0.50 when env=0.50
+        _sell_tokens  = int(pos["amount_tokens"] * _sell_frac)
+        _remain_tokens = pos["amount_tokens"] - _sell_tokens
+
+        logger.info(
+            f"[TP1] {token_mint[:8]} | pnl={pnl_pct:+.1f}% — "
+            f"partial sell: {_sell_tokens:,} tokens ({TAKE_PROFIT_PCT:.0f}%) | "
+            f"remaining: {_remain_tokens:,}"
+        )
+
+        _tp1_quote = await get_sell_quote(session, token_mint, _sell_tokens)
+        _partial_received_sol = 0.0
+        _tp1_sig              = None
+        _tp1_ok               = False
+
+        if _tp1_quote is None:
+            logger.warning(
+                f"[TP1] {token_mint[:8]} | quote failed — fail-open: "
+                f"setting min_target_hit, keeping full position"
+            )
+        else:
+            if DRY_RUN:
+                _partial_received_sol = int(_tp1_quote.get("outAmount", 0)) / 1_000_000_000
+                _tp1_sig = "DRY_RUN_TP1_SIG"
+                _tp1_ok  = True
+                logger.info(
+                    f"[DRY RUN] TP1 would sell {_sell_tokens:,} tokens → "
+                    f"{_partial_received_sol:.4f} SOL"
+                )
+            else:
+                _tp1_sig, _tp1_msg = await execute_swap(session, _tp1_quote, wallet_pubkey)
+                if _tp1_sig:
+                    _partial_received_sol = (
+                        int(_tp1_quote.get("outAmount", 0)) / 1_000_000_000
+                    )
+                    _tp1_ok = True
+                else:
+                    logger.warning(
+                        f"[TP1] {token_mint[:8]} | swap failed ({_tp1_msg}) — "
+                        f"fail-open: setting min_target_hit, keeping full position"
+                    )
+
+        if _tp1_ok:
+            # Reduce cost basis by SOL received; position is now a free ride.
+            # Setting entry_sol ≈ 0 disables hard-floor protection naturally —
+            # pnl_pct will always be extremely positive going forward.
+            _new_entry = max(entry_sol - _partial_received_sol, 0.0001)
+            open_positions[token_mint].update({
+                "amount_tokens":    _remain_tokens,
+                "min_target_hit":   True,
+                "tp1_received_sol": _partial_received_sol,
+                "entry_sol":        _new_entry,
+                # Recalibrate peak to remaining position value so trailing stop
+                # runs from the TP1 price level, not the old full-position peak.
+                "peak_sol":         _partial_received_sol,
+            })
+            _stats["tp1_partials_executed"] += 1
+        else:
+            # Swap failed or quote unavailable — still arm trailing stop.
+            open_positions[token_mint]["min_target_hit"] = True
+
+        _save_positions()
+
+        _tp1_trail_pct = tier["trail_pct"]
+        if _tp1_ok:
+            send_telegram(
+                f"💰 <b>TP1 HIT</b> — {_tp1_label}\n"
+                f"Sold {TAKE_PROFIT_PCT:.0f}% at 2x\n"
+                f"Received: {_partial_received_sol:.4f} SOL (initial back)\n"
+                f"Remainder: {_partial_received_sol:.4f} SOL riding free\n"
+                f"Trailing stop: {_tp1_trail_pct:.0f}% from peak"
+                + (f"\nSig: <code>{_tp1_sig}</code>" if not DRY_RUN else "")
+            )
+        else:
+            send_telegram(
+                f"💰 <b>TP1 HIT</b> — {_tp1_label}\n"
+                f"⚠️ Partial sell failed — monitoring full position\n"
+                f"Trailing stop: {_tp1_trail_pct:.0f}% from peak"
+            )
+
+        logger.info(
+            f"[TP1] {token_mint[:8]} | "
+            f"{'EXECUTED' if _tp1_ok else 'FAILED (fail-open)'} | "
+            f"received={_partial_received_sol:.4f} SOL | "
+            f"remaining_tokens={_remain_tokens:,}"
+        )
+        return   # re-evaluate remaining position fresh next tick
+    # ----------------------------------------------------------------------
 
     # Activate trailing stop once min target is reached (latches — never resets)
     if not min_target_hit and pnl_pct >= tier["min_target_pct"]:
