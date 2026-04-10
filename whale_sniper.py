@@ -8,6 +8,7 @@ from __future__ import annotations
 import os
 import re
 import asyncio
+import base64
 import logging
 import time
 import json
@@ -16,6 +17,8 @@ import anthropic
 import requests
 from logging.handlers import TimedRotatingFileHandler
 from dotenv import load_dotenv
+from solders.keypair import Keypair as SoldersKeypair
+from solders.transaction import VersionedTransaction
 
 load_dotenv()
 
@@ -47,7 +50,9 @@ WSOL_MINT        = "So11111111111111111111111111111111111111112"
 
 DRY_RUN          = os.getenv("DRY_RUN", "True").lower() == "true"
 BUY_AMOUNT_SOL   = float(os.getenv("BUY_AMOUNT_SOL", "0.1"))
-MAX_SLIPPAGE_BPS      = int(os.getenv("MAX_SLIPPAGE_BPS", "1500"))
+MAX_SLIPPAGE_BPS      = int(os.getenv("MAX_SLIPPAGE_BPS", "2000"))
+SELL_SLIPPAGE_BPS     = 2000   # 20% slippage for sells
+PREFER_JUPITER_SELLS  = True   # Jupiter first for sells; PumpPortal as fallback
 PRIORITY_FEE_LAMPORTS = int(os.getenv("PRIORITY_FEE_LAMPORTS", "100000"))
 
 TX_CONFIRM_TIMEOUT_SEC = 30   # give up on confirmation after this many seconds
@@ -61,8 +66,9 @@ WHALE_WALLETS: dict[str, str] = {
     "peace":    "7b88jCzsirGfLmFMyr7BXbCaDGTtuq8oDTWusqWvLv38",
     "crispy":   "EdbNfzVJjVZFsz1awBezeJpBaySLsckoZyPyaucy3g2R",
     "mannos":   "CAmNcBJ82xr1tzXrwZ6tZKwEFs26TG8kT6dJeR1bxjW9",
-    "mr.putin": "8mzCDvq5JWJh6Cus7XYnnwL2JGCVUXA3bDqaXmzCG5hn",
+    # "mr.putin": "8mzCDvq5JWJh6Cus7XYnnwL2JGCVUXA3bDqaXmzCG5hn",  # disabled 2026-04-07
     "peace2":   "6iZLfoaYvEAuuhnJEiSkwC9exmtMZehpkUVuFzb19sWc",
+    # "spsc":     "7S3E2L25kr6oN2cMP2GQ5tMEfg8jwcmoYo35vvv8rxhW",  # disabled 2026-04-08
     # "early":  "Bv2BAw5UmKxv5SBMWYKqpsh6eXKNGM2RKxJGpGPk5vmb",  # disabled 2026-03-31
 }
 
@@ -72,12 +78,11 @@ last_seen_sig: dict[str, str | None] = {name: None for name in WHALE_WALLETS}
 # Whale activity log: name -> list of (mint, timestamp) for all buys
 _whale_activity: dict[str, list[tuple[str, float]]] = {name: [] for name in WHALE_WALLETS}
 
-CONVICTION_WINDOW_SEC = 1_800   # 30 min  — double-buy detection window
-CONVICTION_MULTIPLIER = 1.5     # position multiplier on high-conviction signal
 ACTIVITY_WINDOW_SEC   = 86_400  # 24 h    — HOT / COLD scoring window
 HOT_THRESHOLD         = 3       # buys in 24 h to be classified HOT
 
 # --- Sell / exit parameters -------------------------------------------
+HARD_TP_MULT       = 2.1    # hard take-profit: sell 100% if current_sol >= entry_sol * this
 TAKE_PROFIT_PCT    = float(os.getenv("TAKE_PROFIT_PCT", "0.50")) * 100  # .env decimal → % (e.g. 0.38 = 38%)
 TRAILING_STOP_PCT  = float(os.getenv("TRAILING_STOP_PCT", "0.10")) * 100  # .env decimal → % (e.g. 0.13 = 13%)
 TIME_STOP_MIN      = int(os.getenv("TIME_STOP_MIN", "30"))  # minutes
@@ -89,12 +94,14 @@ EMERGENCY_CHECK_DELAY_SEC = 5    # seconds after buy before emergency check runs
 
 # --- DexScreener quality filter ---------------------------------------
 DEXSCREENER_API       = "https://api.dexscreener.com/tokens/v1/solana"
-MIN_DEX_LIQUIDITY_USD = 20_000
-MIN_DEX_5M_VOLUME_USD = 10_000
+MIN_DEX_LIQUIDITY_USD    = 4_500
+MIN_DEX_5M_VOLUME_USD    = 10_000
+MIN_PUMP_VIRTUAL_LIQ_USD = 4_500
 
 # --- PumpFun prebond filter -------------------------------------------
 PUMPFUN_API          = "https://frontend-api.pump.fun/coins"
 PREBOND_POS_SIZE_PCT = 0.02   # 2% of current SOL balance for prebond entries
+GRADUATION_MC_USD    = 32_700  # PumpFun bonding curve graduation threshold
 
 # --- MANNOS Autopilot -------------------------------------------------
 # When True: mannos whale signals bypass DexScreener quality checks entirely.
@@ -124,6 +131,7 @@ GRADUATED_WATCHLIST_PATH = "data/graduated_watchlist.json"
 DIP_SNIPER_DROP_PCT      = 50.0   # trigger re-entry if price drops X% from ATH
 DIP_SNIPER_MIN_SCORE     = 65     # minimum Claude score to enter a dip
 WHALE_MIN_SCORE          = 50     # minimum Claude score to enter a whale copy
+CTO_SIGNAL_BUY_SOL       = 0.15   # Fixed position size for DexAlert CTO signals
 DIP_SNIPER_WATCH_HOURS   = 8      # expire tokens from watchlist after X hours
 DIP_SNIPER_CHECK_SEC     = 60     # how often the dip sniper loop runs
 
@@ -147,6 +155,9 @@ BLACKLIST_MINUTES = 45          # minutes to ban a token after a trailing stop l
 # without threading rpc_url through every intermediate function signature.
 _rpc_url: str = ""
 
+# Set once at startup in run() — wallet keypair for signing PumpFun transactions.
+_wallet_keypair: SoldersKeypair | None = None
+
 # --- Daily trade statistics (reset at midnight UTC) -------------------
 _stats: dict = {
     "signals_detected":       0,   # every whale buy signal seen
@@ -159,6 +170,41 @@ _stats: dict = {
     "losses":                 0,   # closed positions with PnL < 0
     "net_pnl_sol":            0.0, # running sum of (exit_sol - entry_sol)
 }
+
+# --- Telegram chat IDs (multi-chat broadcast + control) ---------------
+def _load_chat_ids() -> list[str]:
+    """Load all Telegram chat IDs for alert broadcast from env.
+
+    Includes TELEGRAM_CHAT_ID, TELEGRAM_CHAT_IDS (comma-separated),
+    and TELEGRAM_CHAT_ID_2 so both users receive all alerts.
+    """
+    ids: list[str] = []
+    multi = os.getenv("TELEGRAM_CHAT_IDS", "").strip()
+    if multi:
+        ids.extend(cid.strip() for cid in multi.split(",") if cid.strip())
+    else:
+        single = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+        if single:
+            ids.append(single)
+    secondary = os.getenv("TELEGRAM_CHAT_ID_2", "").strip()
+    if secondary and secondary not in ids:
+        ids.append(secondary)
+    return ids
+
+_telegram_chat_ids: list[str] = _load_chat_ids()
+
+def _load_allowed_control_ids() -> set[str]:
+    """Build set of chat IDs allowed to send commands and tap buttons.
+
+    Includes all broadcast IDs plus TELEGRAM_CHAT_ID_2 (control-only).
+    """
+    ids = set(_telegram_chat_ids)
+    secondary = os.getenv("TELEGRAM_CHAT_ID_2", "").strip()
+    if secondary:
+        ids.add(secondary)
+    return ids
+
+_allowed_control_ids: set[str] = _load_allowed_control_ids()
 
 # --- Per-trade log (for /summary command) -----------------------------
 _trade_log: list[dict] = []   # [{ts: float, pnl_sol: float}, ...]
@@ -277,6 +323,47 @@ def get_sol_balance(rpc_url: str, wallet_pubkey: str) -> float:
         return 0.0
 
 
+async def get_spl_token_balance(
+    session: aiohttp.ClientSession,
+    token_mint: str,
+    wallet_pubkey: str,
+) -> int:
+    """Fetch the live on-chain SPL token balance (raw units, no decimals) for a mint.
+
+    Uses getTokenAccountsByOwner with the same pattern as the safety-check
+    helpers.  Returns 0 if the token account doesn't exist or on any RPC error.
+    """
+    rpc_url = _rpc_url
+    if not rpc_url or not wallet_pubkey:
+        logger.warning("[SPL BAL] rpc_url or wallet_pubkey not set — returning 0")
+        return 0
+    try:
+        resp = await _arpc_post(
+            session, rpc_url,
+            "getTokenAccountsByOwner",
+            [
+                wallet_pubkey,
+                {"mint": token_mint},
+                {"encoding": "jsonParsed", "commitment": "confirmed"},
+            ],
+        )
+        accts = (resp.get("result") or {}).get("value") or []
+        total_raw = 0
+        for acct in accts:
+            info = (
+                (acct.get("account") or {})
+                .get("data", {})
+                .get("parsed", {})
+                .get("info", {})
+            )
+            amount_str = (info.get("tokenAmount") or {}).get("amount") or "0"
+            total_raw += int(amount_str)
+        return total_raw
+    except Exception as e:
+        logger.error(f"[SPL BAL] getTokenAccountsByOwner failed for {token_mint[:8]}: {e}")
+        return 0
+
+
 # --- DexScreener quality check ----------------------------------------
 
 async def fetch_dexscreener(
@@ -311,6 +398,57 @@ def passes_dex_quality(pair_data: dict) -> tuple[bool, str]:
     if v5m < MIN_DEX_5M_VOLUME_USD:
         return False, f"5m vol ${v5m:,.0f} below ${MIN_DEX_5M_VOLUME_USD:,}"
     return True, f"liq=${liq:,.0f} 5m_vol=${v5m:,.0f}"
+
+
+async def fetch_pumpfun_data(
+    session: aiohttp.ClientSession,
+    token_mint: str,
+) -> dict | None:
+    """
+    Fetch token data directly from PumpFun for pre-graduation coins.
+    Returns dict with: virtual_sol_reserves, usd_market_cap, created_timestamp,
+    name, symbol, bonding_curve_progress. Returns None on failure (fail-open).
+    Retries up to 3 times on 530 (temporary server error).
+    """
+    url = f"{PUMPFUN_API}/{token_mint}"
+    for attempt in range(3):
+        try:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                if resp.status == 404:
+                    return None
+                if resp.status == 530:
+                    logger.warning(
+                        f"PumpFun 530 for {token_mint[:8]} — "
+                        f"retry {attempt + 1}/3"
+                    )
+                    if attempt < 2:
+                        await asyncio.sleep(2)
+                        continue
+                    return None
+                resp.raise_for_status()
+                return await resp.json()
+        except Exception as e:
+            logger.warning(f"PumpFun data fetch failed for {token_mint[:8]}: {e}")
+            return None
+    return None
+
+
+def passes_pump_quality(pump_data: dict, sol_price_usd: float = 140.0) -> tuple[bool, str]:
+    """
+    Quality check for pre-graduation PumpFun coins using bonding curve data.
+    Uses virtual_sol_reserves as liquidity proxy.
+    Fail-open if data missing.
+    """
+    virtual_sol = pump_data.get("virtual_sol_reserves", 0) or 0
+    # Convert lamports to SOL if needed (values > 1000 are likely lamports)
+    if virtual_sol > 1000:
+        virtual_sol = virtual_sol / 1_000_000_000
+    virtual_liq_usd = virtual_sol * sol_price_usd
+    mcap = pump_data.get("usd_market_cap", 0) or 0
+
+    if virtual_liq_usd < MIN_PUMP_VIRTUAL_LIQ_USD:
+        return False, f"PumpFun virtual liq ${virtual_liq_usd:,.0f} below ${MIN_PUMP_VIRTUAL_LIQ_USD:,}"
+    return True, f"pump_liq=${virtual_liq_usd:,.0f} mcap=${mcap:,.0f}"
 
 
 # --- Token safety check -----------------------------------------------
@@ -875,6 +1013,7 @@ async def get_claude_score(
     dex_pair: dict | None,
     prebond_progress: float | None,
     context_note: str = "",
+    pump_data: dict | None = None,
 ) -> tuple[int, list[str] | None]:
     """
     Ask Claude to score a token's short-term trading potential 0-100.
@@ -891,26 +1030,8 @@ async def get_claude_score(
         logger.warning("CLAUDE_API_KEY not set — Claude score defaulting to 70 (fail-open)")
         return 70, None
 
-    liq  = (dex_pair.get("liquidity")   or {}).get("usd", 0)  if dex_pair else 0
-    v5m  = (dex_pair.get("volume")      or {}).get("m5",  0)  if dex_pair else 0
-    v1h  = (dex_pair.get("volume")      or {}).get("h1",  0)  if dex_pair else 0
-    p5m  = (dex_pair.get("priceChange") or {}).get("m5",  0)  if dex_pair else 0
-    p1h  = (dex_pair.get("priceChange") or {}).get("h1",  0)  if dex_pair else 0
-
-    prompt = (
-        "You are a Solana memecoin trading analyst. Score this token's short-term "
-        "(1-2h) trading potential from 0 to 100 based on these on-chain metrics:\n\n"
-        f"Liquidity USD:    ${liq:,.0f}\n"
-        f"5m Volume USD:    ${v5m:,.0f}\n"
-        f"1h Volume USD:    ${v1h:,.0f}\n"
-        f"5m Price Change:  {p5m:+.1f}%\n"
-        f"1h Price Change:  {p1h:+.1f}%\n"
-    )
-    if prebond_progress is not None:
-        prompt += f"Bonding curve progress: {prebond_progress:.1f}%\n"
-    if context_note:
-        prompt += f"Context: {context_note}\n"
-    prompt += (
+    # --- Build mode-specific prompt ---
+    _response_format = (
         "\nRespond in this exact format — no other text:\n"
         "SCORE: <integer 0-100>\n"
         "- <reason 1, max 10 words>\n"
@@ -919,6 +1040,84 @@ async def get_claude_score(
         "- <reason 4, max 10 words>\n"
         "Omit bullet lines you don't need. No other text."
     )
+
+    if pump_data is not None and dex_pair is None:
+        # ── PRE-GRAD MODE ──────────────────────────────────────────────
+        _vsol = pump_data.get("virtual_sol_reserves", 0) or 0
+        if _vsol > 1000:
+            _vsol = _vsol / 1_000_000_000
+        _liq_usd = _vsol * 140.0
+        _mcap = pump_data.get("usd_market_cap", 0) or 0
+        _prog = prebond_progress if prebond_progress is not None else 0
+
+        prompt = (
+            "You are a Solana memecoin trading analyst scoring a PRE-GRADUATION "
+            "pump.fun bonding curve token. This token has NO AMM pool yet.\n\n"
+            "IMPORTANT: Volume and price change metrics are MEANINGLESS for bonding "
+            "curve tokens — ignore them entirely.\n\n"
+            "Pump.fun graduation threshold is $32,700 market cap. "
+            "Bonding % = (mcap / 32700) * 100.\n\n"
+            "On-chain metrics:\n"
+            f"Market Cap USD:         ${_mcap:,.0f}\n"
+            f"Bonding Curve Progress: {_prog:.1f}%\n"
+            f"Virtual SOL Reserves:   {_vsol:.2f} SOL (${_liq_usd:,.0f} USD)\n"
+        )
+        if context_note:
+            prompt += f"Context: {context_note}\n"
+        prompt += (
+            "\nScoring criteria (in order of importance):\n"
+            "1. Bonding curve progress: 20-60% = good entry window, "
+            "60-75% = getting late, 75%+ = too close to graduation score low, "
+            "sub-20% = very early and risky\n"
+            "2. Market cap: sub-$10k very early, $10-20k ideal, "
+            "$20-25k late, above $25k too close to graduation\n"
+            "3. Virtual SOL reserves as liquidity depth\n"
+            "4. Whale conviction from context (HOT whale and high conviction "
+            "should significantly boost score)\n\n"
+            "Scoring guidance:\n"
+            "80-100 = HOT whale + 20-60% bonding + $10-20k mcap\n"
+            "60-79  = active whale + reasonable bonding progress\n"
+            "40-59  = borderline — very early or getting late\n"
+            "0-39   = bad entry (75%+ bonding or mcap above $25k or sub-5% bonding)"
+        )
+        prompt += _response_format
+    else:
+        # ── GRADUATED MODE ─────────────────────────────────────────────
+        liq  = (dex_pair.get("liquidity")   or {}).get("usd", 0)  if dex_pair else 0
+        v5m  = (dex_pair.get("volume")      or {}).get("m5",  0)  if dex_pair else 0
+        v1h  = (dex_pair.get("volume")      or {}).get("h1",  0)  if dex_pair else 0
+        p5m  = (dex_pair.get("priceChange") or {}).get("m5",  0)  if dex_pair else 0
+        p1h  = (dex_pair.get("priceChange") or {}).get("h1",  0)  if dex_pair else 0
+
+        prompt = (
+            "You are a Solana memecoin trading analyst scoring a GRADUATED token "
+            "that is live on a DEX with an AMM pool.\n\n"
+            "On-chain metrics:\n"
+            f"Liquidity USD:   ${liq:,.0f}\n"
+            f"5m Volume USD:   ${v5m:,.0f}\n"
+            f"1h Volume USD:   ${v1h:,.0f}\n"
+            f"5m Price Change: {p5m:+.1f}%\n"
+            f"1h Price Change: {p1h:+.1f}%\n"
+        )
+        if context_note:
+            prompt += f"Context: {context_note}\n"
+        prompt += (
+            "\nScoring criteria (in order of importance):\n"
+            "1. 5m volume — most important ($10k+ active, $50k+ strong momentum)\n"
+            "2. Liquidity ($20k+ meaningful, $10k borderline)\n"
+            "3. 1h volume (sustained activity vs one-off spike)\n"
+            "4. 5m price change (positive good, extreme pump above +50% means "
+            "late entry — score lower)\n"
+            "5. 1h price change (overall trend direction)\n"
+            "6. Whale conviction from context (HOT whale and high conviction "
+            "should significantly boost score)\n\n"
+            "Scoring guidance:\n"
+            "80-100 = $20k+ liq + $30k+ 5m vol + positive trend + HOT whale\n"
+            "60-79  = decent metrics + active whale\n"
+            "40-59  = thin liquidity or mixed signals\n"
+            "0-39   = dead volume or negative trend"
+        )
+        prompt += _response_format
 
     try:
         client = anthropic.AsyncAnthropic(api_key=api_key)
@@ -985,6 +1184,55 @@ def _sol_price_from_dex(dex_pair: dict | None) -> float:
     except (ValueError, TypeError):
         pass
     return 0.0
+
+
+# --- MC lookup with DexScreener → PumpFun fallback -------------------
+
+# Cooldown tracker for refresh button (mint → last refresh timestamp)
+_last_refresh: dict[str, float] = {}
+
+
+async def get_current_mc(
+    session: aiohttp.ClientSession,
+    token_mint: str,
+) -> tuple[float, str]:
+    """
+    Fetch current market cap with DexScreener → PumpFun fallback.
+    Returns (market_cap, source_label) where source_label is
+    "DexScreener", "PumpFun", or "unknown".
+    """
+    # Try DexScreener first
+    try:
+        dex = await fetch_dexscreener(session, token_mint)
+        if dex:
+            mc = float(dex.get("marketCap") or dex.get("fdv") or 0)
+            if mc > 0:
+                return mc, "DexScreener"
+    except Exception as e:
+        logger.debug(f"[MC LOOKUP] DexScreener failed for {token_mint[:8]}: {e}")
+
+    # Fall back to PumpFun
+    try:
+        pump = await fetch_pumpfun_data(session, token_mint)
+        if pump:
+            mc = float(pump.get("usd_market_cap") or 0)
+            if mc > 0:
+                return mc, "PumpFun"
+    except Exception as e:
+        logger.debug(f"[MC LOOKUP] PumpFun failed for {token_mint[:8]}: {e}")
+
+    return 0.0, "unknown"
+
+
+def _make_position_buttons(token_mint: str) -> list[list[dict]]:
+    """Build the standard [Sell 50%] [Sell 100%] [Refresh] inline keyboard row."""
+    return [
+        [
+            {"text": "Sell 50%",     "callback_data": f"sell|{token_mint}|50"},
+            {"text": "Sell 100%",    "callback_data": f"sell|{token_mint}|100"},
+            {"text": "\U0001f504 Refresh", "callback_data": f"refresh|{token_mint}"},
+        ]
+    ]
 
 
 # --- Claude scoring Telegram alert ------------------------------------
@@ -1206,19 +1454,18 @@ async def dip_sniper_loop(
                 continue
 
             buy_sol    = round(sol_balance * PREBOND_POS_SIZE_PCT, 4)   # 2% of balance
-            amount_lam = int(buy_sol * 1_000_000_000)
-            quote      = await get_jupiter_quote(session, token_mint, amount_lam)
-            if not quote:
-                logger.error(f"[DIP SNIPER] {token_mint[:8]} | Jupiter quote failed — skipping")
-                continue
+
+            # Use current MC for routing (dip sniper tokens are graduated by definition)
+            _dip_mc, _ = await get_current_mc(session, token_mint)
+            swap_sig, swap_msg = await execute_buy_routed(
+                session, token_mint, buy_sol, wallet_pubkey, _dip_mc
+            )
 
             send_telegram(
                 f"🎯 <b>DIP SNIPER</b> — <code>{token_mint[:8]}</code>\n"
                 f"Dropped {drop_pct:.0f}% from ATH | Claude: {claude_score}/100\n"
                 f"Buying {buy_sol} SOL worth…"
             )
-
-            swap_sig, swap_msg = await execute_swap(session, quote, wallet_pubkey)
             if not swap_sig:
                 logger.error(f"[DIP SNIPER] {token_mint[:8]} | Swap failed: {swap_msg}")
                 continue
@@ -1343,8 +1590,8 @@ async def get_jupiter_quote(
         "slippageBps": str(MAX_SLIPPAGE_BPS),
     }
     url    = f"{JUPITER_API}/quote"
-    delays = [5, 10]   # wait longer between retries — gives Jupiter time to index new tokens
-    for attempt in range(3):
+    delays = [5, 10, 15, 20, 25, 30, 35]   # wait longer between retries — gives Jupiter time to index new tokens
+    for attempt in range(8):
         body = ""
         try:
             async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
@@ -1353,10 +1600,10 @@ async def get_jupiter_quote(
                 return json.loads(body)
         except Exception as e:
             logger.error(
-                f"Jupiter quote attempt {attempt + 1}/3 failed: {e} "
+                f"Jupiter quote attempt {attempt + 1}/8 failed: {e} "
                 f"| response: {body[:300]}"
             )
-            if attempt < 2:
+            if attempt < 7:
                 await asyncio.sleep(delays[attempt])
     return None
 
@@ -1371,17 +1618,17 @@ async def get_sell_quote(
         "inputMint":   token_mint,
         "outputMint":  SOL_MINT,
         "amount":      str(amount_tokens),
-        "slippageBps": str(MAX_SLIPPAGE_BPS),
+        "slippageBps": str(SELL_SLIPPAGE_BPS),
     }
     url = f"{JUPITER_API}/quote"
-    for attempt in range(3):
+    for attempt in range(2):
         try:
             async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 resp.raise_for_status()
                 return await resp.json()
         except Exception as e:
-            logger.error(f"Sell quote attempt {attempt + 1}/3 failed for {token_mint[:8]}: {e}")
-            if attempt < 2:
+            logger.error(f"Sell quote attempt {attempt + 1}/2 failed for {token_mint[:8]}: {e}")
+            if attempt < 1:
                 await asyncio.sleep(2)
     return None
 
@@ -1455,33 +1702,90 @@ async def execute_swap(
         )
         return "DRY_RUN_SIG", "DRY_RUN"
 
+    if _wallet_keypair is None:
+        logger.error("[JUPITER SWAP] _wallet_keypair not loaded — WALLET_PRIVATE_KEY missing or invalid")
+        return None, "keypair not loaded"
+
     payload = {
         "quoteResponse":             quote,
         "userPublicKey":             wallet_pubkey,
         "wrapAndUnwrapSol":          True,
         "dynamicComputeUnitLimit":   True,
-        "prioritizationFeeLamports": PRIORITY_FEE_LAMPORTS,   # was "auto"
+        "prioritizationFeeLamports": PRIORITY_FEE_LAMPORTS,
     }
-    url  = f"{JUPITER_API}/swap"
-    txid = None
-    for attempt in range(3):
+    url = f"{JUPITER_API}/swap"
+
+    # Step 1: Get the serialized transaction from Jupiter
+    swap_tx_b64: str | None = None
+    for attempt in range(8):
         body = ""
         try:
             async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 body = await resp.text()
                 resp.raise_for_status()
-                txid = json.loads(body).get("txid")
-                break   # submission accepted — move to confirmation
+                swap_tx_b64 = json.loads(body).get("swapTransaction")
+                if not swap_tx_b64:
+                    raise RuntimeError(f"No swapTransaction in response: {body[:200]}")
+                break
         except Exception as e:
             logger.error(
-                f"Jupiter swap attempt {attempt + 1}/3 failed: {e} "
+                f"Jupiter swap attempt {attempt + 1}/8 failed: {e} "
                 f"| response: {body[:300]}"
             )
-            if attempt < 2:
+            if attempt < 7:
+                await asyncio.sleep(2)
+
+    if not swap_tx_b64:
+        return None, "Jupiter swap failed after 8 attempts"
+
+    # Step 2: Deserialize, sign, and submit the transaction
+    try:
+        tx_bytes = base64.b64decode(swap_tx_b64)
+        tx = VersionedTransaction.from_bytes(tx_bytes)
+        signed_tx = VersionedTransaction(tx.message, [_wallet_keypair])
+        signed_bytes = bytes(signed_tx)
+    except Exception as exc:
+        logger.error(f"[JUPITER SWAP] Transaction signing failed: {exc}")
+        return None, f"tx signing failed: {exc}"
+
+    encoded = base64.b64encode(signed_bytes).decode("utf-8")
+    rpc_payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "sendTransaction",
+        "params": [
+            encoded,
+            {"encoding": "base64", "skipPreflight": False, "preflightCommitment": "confirmed"},
+        ],
+    }
+
+    txid: str | None = None
+    for attempt in range(8):
+        body_preview = ""
+        try:
+            async with session.post(
+                _rpc_url,
+                json=rpc_payload,
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                raw = await resp.text()
+                body_preview = raw[:300]
+                resp.raise_for_status()
+                data = json.loads(raw)
+                if "error" in data:
+                    raise RuntimeError(f"RPC error: {data['error']}")
+                txid = data.get("result")
+                break
+        except Exception as exc:
+            logger.error(
+                f"[JUPITER SWAP] sendTransaction attempt {attempt + 1}/8 failed: {exc} "
+                f"| response: {body_preview}"
+            )
+            if attempt < 7:
                 await asyncio.sleep(2)
 
     if not txid:
-        return None, "Jupiter swap failed after 3 attempts"
+        return None, "Jupiter sendTransaction failed after 8 attempts"
 
     logger.info(
         f"TX submitted: {txid[:16]}… — waiting up to {TX_CONFIRM_TIMEOUT_SEC}s"
@@ -1495,33 +1799,469 @@ async def execute_swap(
     return txid, reason
 
 
+_PUMPFUN_TRADE_URL = "https://pumpportal.fun/api/trade-local"
+
+
+async def execute_pumpfun_buy(
+    session: aiohttp.ClientSession,
+    token_mint: str,
+    buy_sol: float,
+    wallet_pubkey: str,
+) -> tuple[str | None, str]:
+    """
+    Buy a pre-graduation pump.fun token directly through its bonding curve
+    via the PumpPortal trade-local API.
+
+    Flow:
+      1. POST to pumpportal.fun/api/trade-local → returns raw serialized tx bytes
+      2. Deserialize as VersionedTransaction, sign with _wallet_keypair
+      3. Submit via sendTransaction RPC, wait for confirmation
+
+    Returns (txid, message) on success, (None, reason) on any failure.
+    In DRY_RUN mode returns ("DRY_RUN_SIG", "DRY_RUN") immediately.
+    """
+    if DRY_RUN:
+        logger.info(
+            f"[PUMPFUN BUY] DRY RUN — would buy {buy_sol} SOL of {token_mint[:8]}"
+        )
+        return "DRY_RUN_SIG", "DRY_RUN"
+
+    if _wallet_keypair is None:
+        logger.error("[PUMPFUN BUY] _wallet_keypair not loaded — WALLET_PRIVATE_KEY missing or invalid")
+        return None, "keypair not loaded"
+
+    payload = {
+        "publicKey":        wallet_pubkey,
+        "action":           "buy",
+        "mint":             token_mint,
+        "denominatedInSol": "true",
+        "amount":           buy_sol,
+        "slippage":         20,
+        "priorityFee":      0.005,
+        "pool":             "pump",
+    }
+
+    tx_bytes: bytes | None = None
+    delays = [5, 10, 15, 20, 25, 30, 35]
+    for attempt in range(8):
+        body_preview = ""
+        try:
+            async with session.post(
+                _PUMPFUN_TRADE_URL,
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                raw = await resp.read()
+                body_preview = raw[:300].decode("utf-8", errors="replace")
+                resp.raise_for_status()
+                tx_bytes = raw
+                break
+        except aiohttp.ClientResponseError as exc:
+            if exc.status == 400 and any(
+                kw in body_preview.lower()
+                for kw in ("migrated", "does not exist", "pump-amm")
+            ):
+                logger.warning(
+                    f"[PUMPFUN BUY] Token migrated to pump-amm — use Jupiter "
+                    f"(400: {body_preview[:120]})"
+                )
+                return None, "token migrated to pump-amm — use Jupiter"
+            logger.error(
+                f"[PUMPFUN BUY] Attempt {attempt + 1}/8 failed: {exc} "
+                f"| response: {body_preview}"
+            )
+            if attempt < 7:
+                await asyncio.sleep(delays[attempt])
+        except Exception as exc:
+            logger.error(
+                f"[PUMPFUN BUY] Attempt {attempt + 1}/8 failed: {exc} "
+                f"| response: {body_preview}"
+            )
+            if attempt < 7:
+                await asyncio.sleep(delays[attempt])
+
+    if not tx_bytes:
+        return None, "PumpFun trade-local failed after 8 attempts"
+
+    # Sign the transaction
+    try:
+        tx = VersionedTransaction.from_bytes(tx_bytes)
+        signed_tx = VersionedTransaction(tx.message, [_wallet_keypair])
+        signed_bytes = bytes(signed_tx)
+    except Exception as exc:
+        logger.error(f"[PUMPFUN BUY] Transaction signing failed: {exc}")
+        return None, f"tx signing failed: {exc}"
+
+    # Submit via sendTransaction RPC
+    encoded = base64.b64encode(signed_bytes).decode("utf-8")
+    rpc_payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "sendTransaction",
+        "params": [
+            encoded,
+            {"encoding": "base64", "skipPreflight": False, "preflightCommitment": "confirmed"},
+        ],
+    }
+
+    txid: str | None = None
+    for attempt in range(8):
+        body_preview = ""
+        try:
+            async with session.post(
+                _rpc_url,
+                json=rpc_payload,
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                raw = await resp.text()
+                body_preview = raw[:300]
+                resp.raise_for_status()
+                data = json.loads(raw)
+                if "error" in data:
+                    err_str = str(data["error"])
+                    if "BondingCurveComplete" in err_str or "6005" in err_str or "liquidity migrated" in err_str.lower():
+                        logger.warning(
+                            f"[PUMPFUN BUY] Bonding curve complete — token graduated, skipping retries"
+                        )
+                        return None, "BondingCurveComplete — token graduated to Raydium"
+                    raise RuntimeError(f"RPC error: {data['error']}")
+                txid = data.get("result")
+                break
+        except Exception as exc:
+            logger.error(
+                f"[PUMPFUN BUY] sendTransaction attempt {attempt + 1}/8 failed: {exc} "
+                f"| response: {body_preview}"
+            )
+            if attempt < 7:
+                await asyncio.sleep(delays[attempt])
+
+    if not txid:
+        return None, "PumpFun sendTransaction failed after 8 attempts"
+
+    logger.info(
+        f"[PUMPFUN BUY] TX submitted: {txid[:16]}… — waiting up to {TX_CONFIRM_TIMEOUT_SEC}s"
+    )
+    ok, reason = await confirm_transaction(session, txid)
+    if not ok:
+        logger.error(f"[PUMPFUN BUY] TX {txid[:16]}… confirmation failed: {reason}")
+        return None, reason
+
+    logger.info(f"[PUMPFUN BUY] TX {txid[:16]}… {reason}")
+    return txid, reason
+
+
+async def execute_pumpfun_sell(
+    session: aiohttp.ClientSession,
+    token_mint: str,
+    amount_tokens: int,
+    wallet_pubkey: str,
+) -> tuple[str | None, str]:
+    """
+    Sell tokens on a pump.fun bonding curve via the PumpPortal trade-local API.
+    Same flow as execute_pumpfun_buy but with action="sell".
+    Returns (txid, message) on success, (None, reason) on any failure.
+    In DRY_RUN mode returns ("DRY_RUN_SIG", "DRY_RUN") immediately.
+    """
+    if DRY_RUN:
+        logger.info(
+            f"[PUMPFUN SELL] DRY RUN — would sell {amount_tokens:,} tokens of {token_mint[:8]}"
+        )
+        return "DRY_RUN_SIG", "DRY_RUN"
+
+    if _wallet_keypair is None:
+        logger.error("[PUMPFUN SELL] _wallet_keypair not loaded")
+        return None, "keypair not loaded"
+
+    payload = {
+        "publicKey":        wallet_pubkey,
+        "action":           "sell",
+        "mint":             token_mint,
+        "amount":           amount_tokens,
+        "denominatedInSol": "false",
+        "slippage":         20,
+        "priorityFee":      0.0005,
+        "pool":             "pump",
+    }
+    logger.debug(f"[PUMPFUN SELL] payload: {payload}")
+
+    tx_bytes: bytes | None = None
+    for attempt in range(2):
+        body_preview = ""
+        try:
+            async with session.post(
+                _PUMPFUN_TRADE_URL,
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                raw = await resp.read()
+                body_preview = raw[:300].decode("utf-8", errors="replace")
+                resp.raise_for_status()
+                tx_bytes = raw
+                break
+        except Exception as exc:
+            logger.error(
+                f"[PUMPFUN SELL] Attempt {attempt + 1}/2 failed: {exc} "
+                f"| response: {body_preview}"
+            )
+            if attempt < 1:
+                await asyncio.sleep(5)
+
+    if not tx_bytes:
+        return None, "PumpFun sell trade-local failed after 2 attempts"
+
+    # Sign the transaction
+    try:
+        tx = VersionedTransaction.from_bytes(tx_bytes)
+        signed_tx = VersionedTransaction(tx.message, [_wallet_keypair])
+        signed_bytes = bytes(signed_tx)
+    except Exception as exc:
+        logger.error(f"[PUMPFUN SELL] Transaction signing failed: {exc}")
+        return None, f"tx signing failed: {exc}"
+
+    # Submit via sendTransaction RPC
+    encoded = base64.b64encode(signed_bytes).decode("utf-8")
+    rpc_payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "sendTransaction",
+        "params": [
+            encoded,
+            {"encoding": "base64", "skipPreflight": False, "preflightCommitment": "confirmed"},
+        ],
+    }
+
+    txid: str | None = None
+    for attempt in range(2):
+        body_preview = ""
+        try:
+            async with session.post(
+                _rpc_url,
+                json=rpc_payload,
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                raw = await resp.text()
+                body_preview = raw[:300]
+                resp.raise_for_status()
+                data = json.loads(raw)
+                if "error" in data:
+                    err_str = str(data["error"])
+                    if "BondingCurveComplete" in err_str or "6005" in err_str:
+                        logger.warning(
+                            f"[PUMPFUN SELL] Bonding curve complete — "
+                            f"token graduated, skipping retries"
+                        )
+                        return None, "BondingCurveComplete — token graduated"
+                    raise RuntimeError(f"RPC error: {data['error']}")
+                txid = data.get("result")
+                break
+        except Exception as exc:
+            logger.error(
+                f"[PUMPFUN SELL] sendTransaction attempt {attempt + 1}/2 failed: {exc} "
+                f"| response: {body_preview}"
+            )
+            if attempt < 1:
+                await asyncio.sleep(5)
+
+    if not txid:
+        return None, "PumpFun sell sendTransaction failed after 2 attempts"
+
+    logger.info(
+        f"[PUMPFUN SELL] TX submitted: {txid[:16]}… — waiting up to {TX_CONFIRM_TIMEOUT_SEC}s"
+    )
+    ok, reason = await confirm_transaction(session, txid)
+    if not ok:
+        logger.error(f"[PUMPFUN SELL] TX {txid[:16]}… confirmation failed: {reason}")
+        return None, reason
+
+    logger.info(f"[PUMPFUN SELL] TX {txid[:16]}… {reason}")
+    return txid, reason
+
+
+# --- Unified swap router -----------------------------------------------
+
+
+def _is_graduated(mc_usd: float) -> bool:
+    """Single source of truth: returns True if MC indicates post-graduation."""
+    return mc_usd >= GRADUATION_MC_USD
+
+
+async def execute_buy_routed(
+    session: aiohttp.ClientSession,
+    token_mint: str,
+    buy_sol: float,
+    wallet_pubkey: str,
+    mc_usd: float,
+) -> tuple[str | None, str]:
+    """
+    Unified buy router. Routes to PumpFun or Jupiter based on graduation status.
+    - Pre-grad:  PumpFun only (no Jupiter fallback)
+    - Post-grad: PumpFun first, Jupiter fallback on failure
+    - MC unknown (0): live-fetch MC → route accordingly; default to Jupiter if still unknown
+    Returns (txid, message) or (None, reason).
+    """
+    # If MC is unknown (PumpFun 530s or data unavailable), try a live lookup
+    if mc_usd <= 0:
+        mc_usd, mc_src = await get_current_mc(session, token_mint)
+        if mc_usd > 0:
+            logger.info(
+                f"[ROUTER] MC=${mc_usd:,.0f} from {mc_src} — "
+                f"routing to {'Jupiter (graduated)' if _is_graduated(mc_usd) else 'PumpFun (pre-grad)'}"
+            )
+        else:
+            # Both sources failed — default to Jupiter as safe fallback
+            logger.info(
+                f"[ROUTER] MC fetch failed — defaulting to Jupiter (safe fallback)"
+            )
+            amount_lamports = int(buy_sol * 1_000_000_000)
+            quote = await get_jupiter_quote(session, token_mint, amount_lamports)
+            if not quote:
+                return None, "MC unknown + Jupiter quote failed"
+            return await execute_swap(session, quote, wallet_pubkey)
+
+    if not _is_graduated(mc_usd):
+        logger.info(f"[ROUTER] PumpFun (pre-grad) — MC ${mc_usd:,.0f} < ${GRADUATION_MC_USD:,}")
+        return await execute_pumpfun_buy(session, token_mint, buy_sol, wallet_pubkey)
+
+    # Post-graduation: try PumpFun first
+    logger.info(f"[ROUTER] PumpFun (post-grad, primary) — MC ${mc_usd:,.0f}")
+    sig, msg = await execute_pumpfun_buy(session, token_mint, buy_sol, wallet_pubkey)
+    if sig:
+        return sig, msg
+
+    # PumpFun failed — fall back to Jupiter
+    logger.info(f"[ROUTER] Jupiter (post-grad, fallback) — PumpFun failed: {msg}")
+    amount_lamports = int(buy_sol * 1_000_000_000)
+    quote = await get_jupiter_quote(session, token_mint, amount_lamports)
+    if not quote:
+        return None, f"Jupiter quote also failed after PumpFun: {msg}"
+    return await execute_swap(session, quote, wallet_pubkey)
+
+
+async def execute_sell_routed(
+    session: aiohttp.ClientSession,
+    token_mint: str,
+    amount_tokens: int,
+    wallet_pubkey: str,
+    mc_usd: float,
+) -> tuple[str | None, str]:
+    """
+    Unified sell router. Route order depends on PREFER_JUPITER_SELLS.
+    Returns (txid, message) or (None, reason).
+    """
+    grad_label = "post-grad" if _is_graduated(mc_usd) else "pre-grad"
+
+    if PREFER_JUPITER_SELLS:
+        # --- Jupiter first, PumpPortal fallback ---
+        logger.info(f"[ROUTER] Jupiter sell ({grad_label}, primary) — MC ${mc_usd:,.0f}")
+        quote = await get_sell_quote(session, token_mint, amount_tokens)
+        if quote:
+            jup_sig, jup_msg = await execute_swap(session, quote, wallet_pubkey)
+            if jup_sig:
+                logger.info(f"[ROUTER] Sell succeeded via Jupiter")
+                return jup_sig, f"{jup_msg} (via Jupiter)"
+            jup_fail = jup_msg
+        else:
+            jup_fail = "Jupiter sell quote failed"
+
+        logger.info(f"[ROUTER] PumpPortal sell ({grad_label}, fallback) — Jupiter failed: {jup_fail}")
+        send_telegram(
+            f"⚠️ <b>Jupiter sell failed</b> — attempting PumpPortal fallback\n"
+            f"Reason: {jup_fail}"
+        )
+        sig, msg = await execute_pumpfun_sell(session, token_mint, amount_tokens, wallet_pubkey)
+        if sig:
+            logger.info(f"[ROUTER] Sell succeeded via PumpPortal fallback")
+            return sig, f"{msg} (via PumpPortal fallback)"
+        return None, f"Jupiter: {jup_fail} | PumpPortal: {msg}"
+
+    else:
+        # --- PumpPortal first, Jupiter fallback ---
+        logger.info(f"[ROUTER] PumpPortal sell ({grad_label}, primary) — MC ${mc_usd:,.0f}")
+        sig, msg = await execute_pumpfun_sell(session, token_mint, amount_tokens, wallet_pubkey)
+        if sig:
+            logger.info(f"[ROUTER] Sell succeeded via PumpPortal")
+            return sig, f"{msg} (via PumpPortal)"
+
+        logger.info(f"[ROUTER] Jupiter sell ({grad_label}, fallback) — PumpPortal failed: {msg}")
+        send_telegram(
+            f"⚠️ <b>PumpPortal sell failed</b> — attempting Jupiter fallback\n"
+            f"Reason: {msg}"
+        )
+        quote = await get_sell_quote(session, token_mint, amount_tokens)
+        if not quote:
+            return None, f"PumpPortal: {msg} | Jupiter quote also failed"
+        jup_sig, jup_msg = await execute_swap(session, quote, wallet_pubkey)
+        if jup_sig:
+            logger.info(f"[ROUTER] Sell succeeded via Jupiter fallback")
+            return jup_sig, f"{jup_msg} (via Jupiter fallback)"
+        return None, f"PumpPortal: {msg} | Jupiter: {jup_msg}"
+
+
 # --- Telegram ---------------------------------------------------------
 
 def send_telegram(message: str) -> bool:
     """
-    Send a Telegram message.  Returns True on success, False on any failure.
-    Logs ERROR (not just WARNING) so failures are always visible in pm2 logs.
+    Send a Telegram message to all authorised chat IDs.
+    Returns True if at least one delivery succeeded.
     """
-    token   = os.getenv("TELEGRAM_BOT_TOKEN")
-    chat_id = os.getenv("TELEGRAM_CHAT_ID")
-    if not token or not chat_id:
-        logger.error("send_telegram: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set — alert dropped")
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    if not token or not _telegram_chat_ids:
+        logger.error("send_telegram: TELEGRAM_BOT_TOKEN or chat IDs not set — alert dropped")
         return False
-    try:
-        resp = requests.post(
-            f"https://api.telegram.org/bot{token}/sendMessage",
-            json={"chat_id": chat_id, "text": message, "parse_mode": "HTML"},
-            timeout=5,
-        )
-        resp.raise_for_status()   # raises on 4xx / 5xx — was previously missing
-        logger.info(f"Telegram alert sent (message_id={resp.json().get('result',{}).get('message_id')})")
-        return True
-    except requests.exceptions.HTTPError as e:
-        logger.error(f"Telegram HTTP error {e.response.status_code}: {e.response.text}")
+    any_ok = False
+    for chat_id in _telegram_chat_ids:
+        try:
+            resp = requests.post(
+                f"https://api.telegram.org/bot{token}/sendMessage",
+                json={"chat_id": chat_id, "text": message, "parse_mode": "HTML"},
+                timeout=5,
+            )
+            resp.raise_for_status()
+            logger.info(f"Telegram alert sent to {chat_id} (message_id={resp.json().get('result',{}).get('message_id')})")
+            any_ok = True
+        except requests.exceptions.HTTPError as e:
+            logger.error(f"Telegram HTTP error for {chat_id}: {e.response.status_code}: {e.response.text}")
+        except Exception as e:
+            logger.error(f"Telegram send failed for {chat_id}: {e}")
+    return any_ok
+
+
+def send_telegram_with_buttons(
+    message: str,
+    inline_keyboard: list[list[dict]],
+) -> bool:
+    """
+    Send a Telegram message with an inline keyboard to all authorised chat IDs.
+    Returns True if at least one delivery succeeded.
+    """
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    if not token or not _telegram_chat_ids:
+        logger.error("send_telegram_with_buttons: credentials not set — alert dropped")
         return False
-    except Exception as e:
-        logger.error(f"Telegram send failed: {e}")
-        return False
+    any_ok = False
+    for chat_id in _telegram_chat_ids:
+        try:
+            resp = requests.post(
+                f"https://api.telegram.org/bot{token}/sendMessage",
+                json={
+                    "chat_id":      chat_id,
+                    "text":         message,
+                    "parse_mode":   "HTML",
+                    "reply_markup": {
+                        "inline_keyboard": inline_keyboard,
+                    },
+                },
+                timeout=5,
+            )
+            resp.raise_for_status()
+            logger.info(
+                f"Telegram alert with buttons sent to {chat_id} "
+                f"(message_id={resp.json().get('result',{}).get('message_id')})"
+            )
+            any_ok = True
+        except Exception as e:
+            logger.error(f"Telegram send_with_buttons failed for {chat_id}: {e}")
+    return any_ok
 
 
 # --- Position exit logic ----------------------------------------------
@@ -1539,16 +2279,31 @@ async def check_and_maybe_exit(
     if pos is None:
         return  # already closed by a concurrent check
 
-    # Fetch current sell value
-    sell_quote = await get_sell_quote(session, token_mint, pos["amount_tokens"])
-    if sell_quote is None:
-        logger.warning(
-            f"[{token_mint[:8]}] sell quote failed this tick — retrying next cycle"
-        )
-        return  # keep position open; try again in POSITION_CHECK_SEC
-
-    current_sol    = int(sell_quote.get("outAmount", 0)) / 1_000_000_000
     entry_sol      = pos["entry_sol"]
+    mc_entry       = pos.get("mc_entry", 0.0)
+
+    # Fetch current MC for routing decisions and PnL estimation
+    mc_now, mc_source = await get_current_mc(session, token_mint)
+
+    # Log graduation transition
+    if mc_entry and mc_entry < GRADUATION_MC_USD and mc_now >= GRADUATION_MC_USD:
+        logger.info(
+            f"[GRADUATION] {token_mint[:8]} has graduated — "
+            f"switching to PumpFun/Jupiter routing for sells"
+        )
+
+    # Estimate current value: try Jupiter sell quote first, fall back to MC ratio
+    sell_quote = await get_sell_quote(session, token_mint, pos["amount_tokens"])
+    if sell_quote is not None:
+        current_sol = int(sell_quote.get("outAmount", 0)) / 1_000_000_000
+    elif mc_entry and mc_now:
+        current_sol = entry_sol * (mc_now / mc_entry)
+    else:
+        logger.warning(
+            f"[{token_mint[:8]}] sell quote and MC both unavailable — retrying next cycle"
+        )
+        return
+
     peak_sol       = pos["peak_sol"]
     elapsed_min    = (time.time() - pos["entry_time"]) / 60
 
@@ -1561,10 +2316,155 @@ async def check_and_maybe_exit(
     pnl_pct       = (current_sol / entry_sol - 1) * 100 if entry_sol > 0 else 0.0
     drop_from_peak = (current_sol / peak_sol  - 1) * 100 if peak_sol  > 0 else 0.0
 
+    # Debug: MC-based hard sell floor check every cycle
+    _hard_sell_mc = mc_entry * 0.65 if mc_entry else 0
     logger.debug(
         f"[{token_mint[:8]}] hold — pnl={pnl_pct:+.1f}% | "
-        f"peak_drop={drop_from_peak:.1f}% | {elapsed_min:.0f}m elapsed"
+        f"peak_drop={drop_from_peak:.1f}% | {elapsed_min:.0f}m elapsed | "
+        f"MC now={mc_now:,.0f} | MC entry={mc_entry:,.0f} | "
+        f"hard sell MC={_hard_sell_mc:,.0f}"
     )
+
+    # --- MC-BASED HARD SELL FLOOR: sell 100% if MC drops to -35% of entry ---
+    if mc_entry and mc_now and mc_now <= _hard_sell_mc:
+        _hsf_label = pos.get("token_label") or token_mint[:8]
+        _hsf_drop_pct = (mc_now / mc_entry - 1) * 100
+        logger.info(
+            f"[HARD SELL FLOOR] {token_mint[:8]} | MC now={mc_now:,.0f} <= "
+            f"hard sell={_hard_sell_mc:,.0f} ({_hsf_drop_pct:+.1f}% from entry) — selling 100%"
+        )
+
+        # Fetch live on-chain balance and sync
+        _hsf_live_tokens = await get_spl_token_balance(session, token_mint, wallet_pubkey)
+        if _hsf_live_tokens <= 0:
+            logger.warning(f"[HARD SELL FLOOR] {token_mint[:8]} | on-chain balance is 0 — aborting sell")
+            send_telegram(
+                f"⚠️ <b>HARD SELL FLOOR ABORTED</b> — {_hsf_label}\n"
+                f"Wallet shows no token balance on-chain"
+            )
+            return
+        open_positions[token_mint]["amount_tokens"] = _hsf_live_tokens
+        _save_positions()
+
+        if DRY_RUN:
+            _hsf_sig = "DRY_RUN_HARD_SELL_FLOOR"
+            logger.info(
+                f"[DRY RUN] Hard sell floor would sell {_hsf_live_tokens:,} tokens → "
+                f"{current_sol:.4f} SOL"
+            )
+        else:
+            _hsf_sig, _hsf_msg = await execute_sell_routed(
+                session, token_mint, _hsf_live_tokens, wallet_pubkey, mc_now
+            )
+            if not _hsf_sig:
+                logger.error(
+                    f"[HARD SELL FLOOR] {token_mint[:8]} | Sell failed ({_hsf_msg}) — "
+                    f"keeping position open, will retry next cycle"
+                )
+                send_telegram(
+                    f"⚠️ <b>HARD SELL FLOOR FAILED</b> — {_hsf_label}\n"
+                    f"Reason: {_hsf_msg}\n"
+                    f"Position stays open — will retry"
+                )
+                return
+
+        # Success — close position
+        _hsf_pnl_sol = current_sol - entry_sol
+        del open_positions[token_mint]
+        _save_positions()
+
+        if pnl_pct >= 0:
+            _stats["wins"] += 1
+        else:
+            _stats["losses"] += 1
+        _stats["net_pnl_sol"] = round(_stats["net_pnl_sol"] + _hsf_pnl_sol, 6)
+        _record_trade(_hsf_pnl_sol)
+
+        _hsf_pnl_sign = "+" if pnl_pct >= 0 else ""
+        send_telegram(
+            f"🛑 <b>HARD SELL FLOOR (-35%)</b> — {_hsf_label}\n"
+            f"MC Entry: {_fmt_usd(mc_entry)} → MC Now: {_fmt_usd(mc_now)}\n"
+            f"Received: {current_sol:.4f} SOL\n"
+            f"PnL: {_hsf_pnl_sign}{pnl_pct:.1f}%\n"
+            f"Sig: <code>{_hsf_sig}</code>"
+        )
+        logger.info(
+            f"[HARD SELL FLOOR] {token_mint[:8]} | CLOSED | "
+            f"MC {_fmt_usd(mc_entry)} → {_fmt_usd(mc_now)} | "
+            f"PnL: {_hsf_pnl_sign}{pnl_pct:.1f}%"
+        )
+        return
+    # --- END MC-BASED HARD SELL FLOOR ---
+
+    # --- HARD TAKE-PROFIT: sell 100% if position reaches HARD_TP_MULT ---
+    if current_sol >= entry_sol * HARD_TP_MULT:
+        _htp_label = pos.get("token_label") or token_mint[:8]
+        _htp_reason = f"HARD TP ({HARD_TP_MULT:.1f}x)"
+        logger.info(
+            f"[HARD TP] {token_mint[:8]} | current={current_sol:.4f} >= "
+            f"entry={entry_sol:.4f} × {HARD_TP_MULT} — selling 100%"
+        )
+
+        # Fetch live on-chain balance and sync to stored position
+        _htp_live_tokens = await get_spl_token_balance(session, token_mint, wallet_pubkey)
+        if _htp_live_tokens <= 0:
+            logger.warning(f"[HARD TP] {token_mint[:8]} | on-chain balance is 0 — aborting sell")
+            send_telegram(
+                f"⚠️ <b>HARD TP ABORTED</b> — {_htp_label}\n"
+                f"Wallet shows no token balance on-chain"
+            )
+            return
+        open_positions[token_mint]["amount_tokens"] = _htp_live_tokens
+        _save_positions()
+
+        if DRY_RUN:
+            _htp_sig = "DRY_RUN_HARD_TP_SIG"
+            logger.info(
+                f"[DRY RUN] Hard TP would sell {_htp_live_tokens:,} tokens → "
+                f"{current_sol:.4f} SOL"
+            )
+        else:
+            _htp_sig, _htp_msg = await execute_sell_routed(
+                session, token_mint, _htp_live_tokens, wallet_pubkey, mc_now
+            )
+            if not _htp_sig:
+                logger.error(
+                    f"[HARD TP] {token_mint[:8]} | Sell failed ({_htp_msg}) — "
+                    f"keeping position open, will retry next cycle"
+                )
+                send_telegram(
+                    f"⚠️ <b>HARD TP SELL FAILED</b> — {_htp_label}\n"
+                    f"Reason: {_htp_msg}\n"
+                    f"Position stays open — will retry"
+                )
+                return
+
+        # Success — close position
+        _htp_pnl_sol = current_sol - entry_sol
+        del open_positions[token_mint]
+        _save_positions()
+
+        if pnl_pct >= 0:
+            _stats["wins"] += 1
+        else:
+            _stats["losses"] += 1
+        _stats["net_pnl_sol"] = round(_stats["net_pnl_sol"] + _htp_pnl_sol, 6)
+        _record_trade(_htp_pnl_sol)
+
+        _htp_pnl_sign = "+" if pnl_pct >= 0 else ""
+        send_telegram(
+            f"🎯 <b>HARD TP ({HARD_TP_MULT:.1f}x)</b> — {_htp_label}\n"
+            f"Received: {current_sol:.4f} SOL\n"
+            f"PnL: {_htp_pnl_sign}{pnl_pct:.1f}%\n"
+            f"Sig: <code>{_htp_sig}</code>"
+        )
+        logger.info(
+            f"[HARD TP] {token_mint[:8]} | CLOSED | "
+            f"Entry: {entry_sol:.4f} SOL | Exit: {current_sol:.4f} SOL | "
+            f"PnL: {_htp_pnl_sign}{pnl_pct:.1f}%"
+        )
+        return
+    # --- END HARD TAKE-PROFIT ---
 
     # --- MANNOS tiered exit ---
     claude_score   = pos.get("claude_score", 70)
@@ -1581,46 +2481,60 @@ async def check_and_maybe_exit(
     if not min_target_hit and pnl_pct >= 100.0:
         _tp1_label    = pos.get("token_label") or token_mint[:8]
         _sell_frac    = TAKE_PROFIT_PCT / 100.0          # e.g. 0.50 when env=0.50
-        _sell_tokens  = int(pos["amount_tokens"] * _sell_frac)
-        _remain_tokens = pos["amount_tokens"] - _sell_tokens
+
+        # Fetch live on-chain balance and sync to stored position
+        _tp1_live_tokens = await get_spl_token_balance(session, token_mint, wallet_pubkey)
+        if _tp1_live_tokens <= 0:
+            logger.warning(f"[TP1] {token_mint[:8]} | on-chain balance is 0 — aborting partial sell")
+            send_telegram(
+                f"⚠️ <b>TP1 ABORTED</b> — {_tp1_label}\n"
+                f"Wallet shows no token balance on-chain"
+            )
+            return
+        open_positions[token_mint]["amount_tokens"] = _tp1_live_tokens
+        _save_positions()
+
+        _sell_tokens  = int(_tp1_live_tokens * _sell_frac)
+        _remain_tokens = _tp1_live_tokens - _sell_tokens
 
         logger.info(
             f"[TP1] {token_mint[:8]} | pnl={pnl_pct:+.1f}% — "
             f"partial sell: {_sell_tokens:,} tokens ({TAKE_PROFIT_PCT:.0f}%) | "
-            f"remaining: {_remain_tokens:,}"
+            f"remaining: {_remain_tokens:,} (live balance: {_tp1_live_tokens:,})"
         )
 
-        _tp1_quote = await get_sell_quote(session, token_mint, _sell_tokens)
         _partial_received_sol = 0.0
         _tp1_sig              = None
         _tp1_ok               = False
 
-        if _tp1_quote is None:
-            logger.warning(
-                f"[TP1] {token_mint[:8]} | quote failed — fail-open: "
-                f"setting min_target_hit, keeping full position"
+        if DRY_RUN:
+            # Estimate from MC ratio
+            if mc_entry and mc_now:
+                _partial_received_sol = (entry_sol * _sell_frac) * (mc_now / mc_entry)
+            else:
+                _partial_received_sol = entry_sol * _sell_frac * 2  # ~2x estimate
+            _tp1_sig = "DRY_RUN_TP1_SIG"
+            _tp1_ok  = True
+            logger.info(
+                f"[DRY RUN] TP1 would sell {_sell_tokens:,} tokens → "
+                f"~{_partial_received_sol:.4f} SOL"
             )
         else:
-            if DRY_RUN:
-                _partial_received_sol = int(_tp1_quote.get("outAmount", 0)) / 1_000_000_000
-                _tp1_sig = "DRY_RUN_TP1_SIG"
-                _tp1_ok  = True
-                logger.info(
-                    f"[DRY RUN] TP1 would sell {_sell_tokens:,} tokens → "
-                    f"{_partial_received_sol:.4f} SOL"
-                )
-            else:
-                _tp1_sig, _tp1_msg = await execute_swap(session, _tp1_quote, wallet_pubkey)
-                if _tp1_sig:
-                    _partial_received_sol = (
-                        int(_tp1_quote.get("outAmount", 0)) / 1_000_000_000
-                    )
-                    _tp1_ok = True
+            _tp1_sig, _tp1_msg = await execute_sell_routed(
+                session, token_mint, _sell_tokens, wallet_pubkey, mc_now
+            )
+            if _tp1_sig:
+                # Estimate SOL received from MC ratio (PumpFun sells don't return outAmount)
+                if mc_entry and mc_now:
+                    _partial_received_sol = (entry_sol * _sell_frac) * (mc_now / mc_entry)
                 else:
-                    logger.warning(
-                        f"[TP1] {token_mint[:8]} | swap failed ({_tp1_msg}) — "
-                        f"fail-open: setting min_target_hit, keeping full position"
-                    )
+                    _partial_received_sol = entry_sol * _sell_frac * 2
+                _tp1_ok = True
+            else:
+                logger.warning(
+                    f"[TP1] {token_mint[:8]} | sell failed ({_tp1_msg}) — "
+                    f"fail-open: setting min_target_hit, keeping full position"
+                )
 
         if _tp1_ok:
             # Reduce cost basis by SOL received; position is now a free ride.
@@ -1704,14 +2618,33 @@ async def check_and_maybe_exit(
         return  # no exit condition met this tick
 
     # --- Execute sell --------------------------------------------------
+    # Fetch live on-chain balance and sync to stored position
+    _exit_live_tokens = await get_spl_token_balance(session, token_mint, wallet_pubkey)
+    if _exit_live_tokens <= 0:
+        _exit_label = pos.get("token_label") or token_mint[:8]
+        logger.warning(
+            f"[{token_mint[:8]}] on-chain balance is 0 — aborting sell "
+            f"(trigger: {exit_reason})"
+        )
+        send_telegram(
+            f"⚠️ <b>SELL ABORTED</b> — {_exit_label}\n"
+            f"Trigger: {exit_reason}\n"
+            f"Wallet shows no token balance on-chain"
+        )
+        return
+    open_positions[token_mint]["amount_tokens"] = _exit_live_tokens
+    _save_positions()
+
     if DRY_RUN:
         sell_sig = "DRY_RUN_SELL_SIG"
         logger.info(
-            f"[DRY RUN] Would sell {pos['amount_tokens']:,} tokens → "
+            f"[DRY RUN] Would sell {_exit_live_tokens:,} tokens → "
             f"{current_sol:.4f} SOL ({exit_reason})"
         )
     else:
-        sell_sig, sell_msg = await execute_swap(session, sell_quote, wallet_pubkey)
+        sell_sig, sell_msg = await execute_sell_routed(
+            session, token_mint, _exit_live_tokens, wallet_pubkey, mc_now
+        )
         if not sell_sig:
             logger.error(
                 f"[{token_mint[:8]}] Sell swap failed ({sell_msg}) — "
@@ -1788,17 +2721,26 @@ async def emergency_dump_check(
     if pos is None:
         return  # already closed by monitor loop — nothing to do
 
+    entry_sol   = pos["entry_sol"]
+    mc_entry    = pos.get("mc_entry", 0.0)
+
+    # Get current MC for routing and price estimate
+    mc_now, _ = await get_current_mc(session, token_mint)
+
+    # Estimate current value: Jupiter quote first, MC ratio fallback
     sell_quote = await get_sell_quote(session, token_mint, pos["amount_tokens"])
-    if sell_quote is None:
+    if sell_quote is not None:
+        current_sol = int(sell_quote.get("outAmount", 0)) / 1_000_000_000
+    elif mc_entry and mc_now:
+        current_sol = entry_sol * (mc_now / mc_entry)
+    else:
         logger.warning(
-            f"[{token_mint[:8]}] emergency check: sell quote failed "
+            f"[{token_mint[:8]}] emergency check: price unavailable "
             f"— normal monitor will handle"
         )
         return
 
-    current_sol = int(sell_quote.get("outAmount", 0)) / 1_000_000_000
-    entry_sol   = pos["entry_sol"]
-    pnl_pct     = (current_sol / entry_sol - 1) * 100 if entry_sol > 0 else 0.0
+    pnl_pct = (current_sol / entry_sol - 1) * 100 if entry_sol > 0 else 0.0
 
     logger.debug(
         f"[{token_mint[:8]}] emergency check: threshold={EMERGENCY_DUMP_PCT:.0f}% "
@@ -1813,14 +2755,29 @@ async def emergency_dump_check(
         f"emergency exit (pnl={pnl_pct:.1f}%, threshold={EMERGENCY_DUMP_PCT:.0f}%)"
     )
 
+    # Fetch live on-chain balance and sync to stored position
+    _emg_live_tokens = await get_spl_token_balance(session, token_mint, wallet_pubkey)
+    if _emg_live_tokens <= 0:
+        _emg_label = pos.get("token_label") or token_mint[:8]
+        logger.warning(f"[{token_mint[:8]}] on-chain balance is 0 — aborting emergency sell")
+        send_telegram(
+            f"⚠️ <b>EMERGENCY SELL ABORTED</b> — {_emg_label}\n"
+            f"Wallet shows no token balance on-chain"
+        )
+        return
+    open_positions[token_mint]["amount_tokens"] = _emg_live_tokens
+    _save_positions()
+
     if DRY_RUN:
         sell_sig = "DRY_RUN_SELL_SIG"
         logger.info(
-            f"[DRY RUN] Would emergency-sell {pos['amount_tokens']:,} tokens "
+            f"[DRY RUN] Would emergency-sell {_emg_live_tokens:,} tokens "
             f"→ {current_sol:.4f} SOL"
         )
     else:
-        sell_sig, sell_msg = await execute_swap(session, sell_quote, wallet_pubkey)
+        sell_sig, sell_msg = await execute_sell_routed(
+            session, token_mint, _emg_live_tokens, wallet_pubkey, mc_now
+        )
         if not sell_sig:
             logger.error(
                 f"[{token_mint[:8]}] Emergency sell failed ({sell_msg}) "
@@ -1895,14 +2852,18 @@ def _summary_message() -> str:
     )
 
 
-async def _holdings_message(session: aiohttp.ClientSession) -> str:
+async def _send_holdings_cards(
+    session: aiohttp.ClientSession,
+    base_url: str,
+    chat_id: str,
+) -> None:
     """
-    Build a live holdings snapshot for the /holdings Telegram command.
-    Fetches fresh MC from DexScreener and SOL price from CoinGecko for each position.
-    Fails open — missing data shows '—' rather than crashing.
+    Send individual position cards with [Sell 50%] [Sell 100%] [Refresh] buttons
+    for each open position, followed by a plain summary footer message.
     """
     if not open_positions:
-        return "📊 No current holdings"
+        await _send_tg(session, base_url, chat_id, "\U0001f4ca No current holdings")
+        return
 
     # Fetch SOL/USD price from CoinGecko once for all positions
     sol_usd = 0.0
@@ -1915,67 +2876,104 @@ async def _holdings_message(session: aiohttp.ClientSession) -> str:
             cg_data = await resp.json()
             sol_usd = float((cg_data.get("solana") or {}).get("usd") or 0)
     except Exception as e:
-        logger.debug(f"[HOLDINGS] CoinGecko fetch failed: {e} — USD estimate omitted")
+        logger.debug(f"[HOLDINGS] CoinGecko fetch failed: {e} \u2014 USD estimate omitted")
 
-    _NUM_EMOJIS = ["1️⃣","2️⃣","3️⃣","4️⃣","5️⃣","6️⃣","7️⃣","8️⃣","9️⃣","🔟"]
-    lines: list[str] = ["📊 <b>Current Holdings</b>"]
+    _NUM_EMOJIS = ["1\ufe0f\u20e3","2\ufe0f\u20e3","3\ufe0f\u20e3","4\ufe0f\u20e3","5\ufe0f\u20e3","6\ufe0f\u20e3","7\ufe0f\u20e3","8\ufe0f\u20e3","9\ufe0f\u20e3","\U0001f51f"]
     total_entry_sol = 0.0
     total_worth_sol = 0.0
 
     for idx, (token_mint, pos) in enumerate(open_positions.items()):
-        num     = _NUM_EMOJIS[idx] if idx < len(_NUM_EMOJIS) else f"{idx + 1}."
+        num       = _NUM_EMOJIS[idx] if idx < len(_NUM_EMOJIS) else f"{idx + 1}."
         entry_sol = pos.get("entry_sol", 0.0)
         mc_entry  = pos.get("mc_entry",  0.0)
-        tl        = pos.get("token_label") or token_mint[:8]
-        whale     = (pos.get("whale") or "?").upper()
-        tp1_hit   = pos.get("min_target_hit", False)
 
-        # Fresh MC from DexScreener
-        dex_now = await fetch_dexscreener(session, token_mint)
-        mc_now  = float((dex_now or {}).get("marketCap") or (dex_now or {}).get("fdv") or 0)
+        # Fresh MC with fallback
+        mc_now, mc_source = await get_current_mc(session, token_mint)
 
         # Worth and PnL derived from MC ratio
         if mc_entry and mc_now:
             worth_sol = entry_sol * (mc_now / mc_entry)
-            pnl_pct   = (mc_now - mc_entry) / mc_entry * 100
         else:
             worth_sol = entry_sol
-            pnl_pct   = 0.0
 
         total_entry_sol += entry_sol
         total_worth_sol += worth_sol
 
-        color    = "🟢" if pnl_pct >= 0 else "🔴"
-        pnl_sign = "+" if pnl_pct >= 0 else ""
-        tp1_icon = "✅" if tp1_hit else "❌"
-
-        lines.append(
-            f"\n{num} <b>{tl}</b>\n"
-            f"   Whale: {whale}\n"
-            f"   Entry MC:  {_fmt_usd(mc_entry) if mc_entry else '—'}\n"
-            f"   Current MC: {_fmt_usd(mc_now) if mc_now else '—'} "
-            f"{color} {pnl_sign}{pnl_pct:.0f}%\n"
-            f"   Entry: {entry_sol:.4f} SOL | Worth: ~{worth_sol:.4f} SOL\n"
-            f"   TP1 hit: {tp1_icon}"
+        card = _build_position_message(token_mint, pos, mc_now, mc_source, num_emoji=num, sol_usd=sol_usd)
+        await _send_tg_with_buttons(
+            session, base_url, chat_id, card,
+            _make_position_buttons(token_mint)
         )
 
-    # Footer totals
+    # Footer summary (plain message, no buttons)
     overall_pnl   = (total_worth_sol / total_entry_sol - 1) * 100 if total_entry_sol else 0.0
-    overall_color = "🟢" if overall_pnl >= 0 else "🔴"
+    overall_color = "\U0001f7e2" if overall_pnl >= 0 else "\U0001f534"
     overall_sign  = "+" if overall_pnl >= 0 else ""
 
-    lines.append(
-        f"\n💼 Total in: {total_entry_sol:.4f} SOL\n"
-        f"📈 Total worth: ~{total_worth_sol:.4f} SOL\n"
-        f"{overall_color} Overall: {overall_sign}{overall_pnl:.0f}%"
-    )
     if sol_usd:
-        lines.append(
-            f"💵 Est. USD value: ~{_fmt_usd(total_worth_sol * sol_usd)}"
-            f" (SOL @ ${sol_usd:,.2f})"
-        )
+        entry_usd_str = f" (~{_fmt_usd(total_entry_sol * sol_usd)} USD)"
+        worth_usd_str = f" (~{_fmt_usd(total_worth_sol * sol_usd)} USD)"
+        sol_price_str = f"\n\U0001f4b5 SOL @ ${sol_usd:,.2f}"
+    else:
+        entry_usd_str = ""
+        worth_usd_str = ""
+        sol_price_str = ""
 
-    return "\n".join(lines)
+    footer = (
+        f"\U0001f4bc Total in: {total_entry_sol:.4f} SOL{entry_usd_str}\n"
+        f"\U0001f4c8 Total worth: ~{total_worth_sol:.4f} SOL{worth_usd_str}\n"
+        f"{overall_color} Overall: {overall_sign}{overall_pnl:.0f}%"
+        f"{sol_price_str}"
+    )
+    await _send_tg(session, base_url, chat_id, footer)
+
+
+async def _send_home_dashboard(
+    session: aiohttp.ClientSession,
+    base_url: str,
+    chat_id: str,
+) -> None:
+    """Send the /home dashboard snapshot."""
+    wallet_pubkey = os.getenv("WALLET_PUBLIC_KEY", "")
+
+    # Live SOL balance
+    sol_balance = get_sol_balance(_rpc_url, wallet_pubkey)
+
+    # Live SOL/USD price
+    sol_usd = 0.0
+    try:
+        async with session.get(
+            "https://api.coingecko.com/api/v3/simple/price",
+            params={"ids": "solana", "vs_currencies": "usd"},
+            timeout=aiohttp.ClientTimeout(total=5),
+        ) as resp:
+            cg_data = await resp.json()
+            sol_usd = float((cg_data.get("solana") or {}).get("usd") or 0)
+    except Exception:
+        pass
+
+    usd_str = f" (~${sol_balance * sol_usd:,.2f} USD)" if sol_usd else ""
+
+    # Stats
+    trades = _stats["trades_executed"]
+    wins   = _stats["wins"]
+    losses = _stats["losses"]
+    total  = wins + losses
+    win_rate = (wins / total * 100) if total > 0 else 0.0
+
+    msg = (
+        "\U0001f3e0 <b>APEX SNIPER — HOME</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"\U0001f4b3 Wallet: <code>{wallet_pubkey}</code>\n"
+        f"\U0001f4b0 Balance: {sol_balance:.4f} SOL{usd_str}\n"
+        f"\U0001f7e2 Status: RUNNING\n"
+        f"\U0001f3af Buy Limit: {BUY_AMOUNT_SOL} SOL\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"\U0001f4ca Trades Executed: {trades}\n"
+        f"\u2705 Wins: {wins} | \u274c Losses: {losses} | \U0001f4c8 Win Rate: {win_rate:.0f}%"
+    )
+
+    await _send_tg(session, base_url, chat_id, msg)
 
 
 def _register_commands() -> None:
@@ -1987,6 +2985,7 @@ def _register_commands() -> None:
         requests.post(
             f"https://api.telegram.org/bot{token}/setMyCommands",
             json={"commands": [
+                {"command": "home",     "description": "Dashboard snapshot"},
                 {"command": "summary",  "description": "12-hour trade summary"},
                 {"command": "holdings", "description": "Current open positions"},
                 {"command": "wallets",  "description": "Show tracked whale wallets"},
@@ -2006,14 +3005,14 @@ async def telegram_command_loop() -> None:
     """
     logger.info("Telegram command loop started — listening for /summary, /holdings")
 
-    token   = os.getenv("TELEGRAM_BOT_TOKEN", "")
-    chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
-    if not token or not chat_id:
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    if not token or not _allowed_control_ids:
         logger.warning("telegram_command_loop: credentials missing — /summary won't respond")
         return
 
-    base_url       = f"https://api.telegram.org/bot{token}"
-    last_update_id = 0
+    authorised_chats = _allowed_control_ids
+    base_url         = f"https://api.telegram.org/bot{token}"
+    last_update_id   = 0
 
     async with aiohttp.ClientSession() as tg_session:
         fail_count = 0
@@ -2052,47 +3051,403 @@ async def telegram_command_loop() -> None:
                 text = (msg.get("text") or "").strip()
                 cid  = str(msg.get("chat", {}).get("id", ""))
 
-                if text.startswith("/summary") and cid == chat_id:
+                if text.startswith("/home") and cid in authorised_chats:
+                    await _send_home_dashboard(tg_session, base_url, cid)
+                    logger.info(f"/home command handled (chat {cid})")
+
+                elif text.startswith("/summary") and cid in authorised_chats:
                     reply = _summary_message()
                     try:
                         async with tg_session.post(
                             f"{base_url}/sendMessage",
-                            json={"chat_id": chat_id, "text": reply, "parse_mode": "HTML"},
+                            json={"chat_id": cid, "text": reply, "parse_mode": "HTML"},
                             timeout=aiohttp.ClientTimeout(total=10),
                         ) as r:
                             r.raise_for_status()
-                            logger.info("/summary command handled")
+                            logger.info(f"/summary command handled (chat {cid})")
                     except Exception as e:
                         logger.warning(f"/summary reply failed: {e}")
 
-                elif text.startswith("/holdings") and cid == chat_id:
-                    reply = await _holdings_message(tg_session)
-                    try:
-                        async with tg_session.post(
-                            f"{base_url}/sendMessage",
-                            json={"chat_id": chat_id, "text": reply, "parse_mode": "HTML"},
-                            timeout=aiohttp.ClientTimeout(total=15),
-                        ) as r:
-                            r.raise_for_status()
-                            logger.info("/holdings command handled")
-                    except Exception as e:
-                        logger.warning(f"/holdings reply failed: {e}")
+                elif text.startswith("/holdings") and cid in authorised_chats:
+                    await _send_holdings_cards(tg_session, base_url, cid)
+                    logger.info(f"/holdings command handled (chat {cid})")
 
-                elif text.startswith("/wallets") and cid == chat_id:
-                    lines = ["👛 <b>Tracked Wallets</b>"]
+                elif text.startswith("/wallets") and cid in authorised_chats:
+                    lines = ["\U0001f45b <b>Tracked Wallets</b>"]
                     for wname, waddr in WHALE_WALLETS.items():
-                        lines.append(f"\n🐋 <b>{wname.upper()}</b>\n<code>{waddr}</code>")
+                        lines.append(f"\n\U0001f40b <b>{wname.upper()}</b>\n<code>{waddr}</code>")
                     reply = "\n".join(lines)
                     try:
                         async with tg_session.post(
                             f"{base_url}/sendMessage",
-                            json={"chat_id": chat_id, "text": reply, "parse_mode": "HTML"},
+                            json={"chat_id": cid, "text": reply, "parse_mode": "HTML"},
                             timeout=aiohttp.ClientTimeout(total=10),
                         ) as r:
                             r.raise_for_status()
-                            logger.info("/wallets command handled")
+                            logger.info(f"/wallets command handled (chat {cid})")
                     except Exception as e:
                         logger.warning(f"/wallets reply failed: {e}")
+
+                # --- Inline sell/refresh button callbacks ------------------
+                cbq = update.get("callback_query")
+                if cbq:
+                    cb_data = cbq.get("data", "")
+                    cb_id   = cbq.get("id", "")
+                    cb_chat = str((cbq.get("message") or {}).get("chat", {}).get("id", ""))
+
+                    if cb_chat not in authorised_chats:
+                        pass  # ignore callbacks from unknown chats
+                    elif cb_data.startswith("sell|"):
+                        await _handle_sell_callback(
+                            tg_session, base_url, cb_id, cb_data, cb_chat
+                        )
+                    elif cb_data.startswith("refresh|"):
+                        cb_msg_id = (cbq.get("message") or {}).get("message_id")
+                        await _handle_refresh_callback(
+                            tg_session, base_url, cb_id, cb_data,
+                            cb_chat, cb_msg_id
+                        )
+
+
+async def _handle_sell_callback(
+    tg_session: aiohttp.ClientSession,
+    base_url: str,
+    callback_id: str,
+    cb_data: str,
+    chat_id: str,
+) -> None:
+    """
+    Process a sell button tap: sell|<token_mint>|<pct>
+    Executes Jupiter swap, updates position, and replies with confirmation.
+    """
+    parts = cb_data.split("|")
+    if len(parts) != 3:
+        return
+    _, token_mint, pct_str = parts
+    try:
+        sell_pct = int(pct_str)
+    except ValueError:
+        return
+
+    pos = open_positions.get(token_mint)
+    if not pos:
+        await _answer_callback(tg_session, base_url, callback_id,
+                               "Position not found — may already be closed.")
+        return
+
+    token_label = pos.get("token_label") or token_mint[:8]
+
+    # Fetch live on-chain balance and sync to stored position
+    wallet_pubkey_btn = os.getenv("WALLET_PUBLIC_KEY", "")
+    live_tokens = await get_spl_token_balance(tg_session, token_mint, wallet_pubkey_btn)
+    if live_tokens <= 0:
+        await _answer_callback(tg_session, base_url, callback_id,
+                               "No on-chain balance for this token.")
+        await _send_tg(tg_session, base_url, chat_id,
+                       f"⚠️ <b>SELL ABORTED</b> — {token_label}\n"
+                       f"Wallet shows no token balance on-chain")
+        return
+    open_positions[token_mint]["amount_tokens"] = live_tokens
+    _save_positions()
+
+    sell_tokens = int(live_tokens * sell_pct / 100)
+    if sell_tokens <= 0:
+        await _answer_callback(tg_session, base_url, callback_id,
+                               "Sell amount too small.")
+        return
+
+    logger.info(
+        f"[SELL BUTTON] {token_label} — selling {sell_pct}% "
+        f"({sell_tokens:,} of {live_tokens:,} live tokens)"
+    )
+
+    # Acknowledge the button press immediately
+    await _answer_callback(tg_session, base_url, callback_id,
+                           f"Selling {sell_pct}% of {token_label}...")
+
+    # Get MC for routing
+    mc_now, _ = await get_current_mc(tg_session, token_mint)
+
+    # Estimate expected SOL from MC ratio
+    entry_sol    = pos["entry_sol"]
+    mc_entry     = pos.get("mc_entry", 0.0)
+    if mc_entry and mc_now:
+        expected_sol = (entry_sol * sell_pct / 100) * (mc_now / mc_entry)
+    else:
+        expected_sol = entry_sol * sell_pct / 100  # fallback: assume flat
+
+    if DRY_RUN:
+        sell_sig = "DRY_RUN_MANUAL_SELL"
+        logger.info(
+            f"[DRY RUN] Would manual-sell {sell_tokens:,} tokens of {token_label} "
+            f"→ ~{expected_sol:.4f} SOL"
+        )
+    else:
+        if _wallet_keypair is None:
+            logger.error(f"[SELL BUTTON] _wallet_keypair is None — cannot sign sell tx")
+            await _send_tg(tg_session, base_url, chat_id,
+                           f"⚠️ <b>SELL FAILED</b> — {token_label}\n"
+                           f"Wallet keypair not loaded — check WALLET_PRIVATE_KEY in .env")
+            return
+        wallet_pubkey = os.getenv("WALLET_PUBLIC_KEY", "")
+        sell_sig, sell_msg = await execute_sell_routed(
+            tg_session, token_mint, sell_tokens, wallet_pubkey, mc_now
+        )
+        if not sell_sig:
+            await _send_tg(tg_session, base_url, chat_id,
+                           f"⚠️ <b>SELL FAILED</b> — {token_label}\n{sell_msg}")
+            return
+
+    pnl_pct   = (expected_sol / (entry_sol * sell_pct / 100) - 1) * 100 if entry_sol > 0 else 0.0
+    pnl_sign  = "+" if pnl_pct >= 0 else ""
+
+    if sell_pct >= 100:
+        # Full sell — remove position
+        _pnl_sol = expected_sol - entry_sol
+        del open_positions[token_mint]
+        _save_positions()
+
+        if _pnl_sol >= 0:
+            _stats["wins"] += 1
+        else:
+            _stats["losses"] += 1
+        _stats["net_pnl_sol"] = round(_stats["net_pnl_sol"] + _pnl_sol, 6)
+        _record_trade(_pnl_sol)
+
+        await _send_tg(tg_session, base_url, chat_id,
+            f"✅ <b>SOLD 100%</b> — {token_label}\n"
+            f"Tokens sold: {sell_tokens:,}\n"
+            f"SOL received: {expected_sol:.4f}\n"
+            f"PnL: {pnl_sign}{pnl_pct:.1f}%\n"
+            f"Position closed."
+            + (f"\nSig: <code>{sell_sig}</code>" if not DRY_RUN else "")
+        )
+    else:
+        # Partial sell — update position
+        remain_tokens = live_tokens - sell_tokens
+        # Reduce entry_sol proportionally to reflect the partial exit
+        remain_entry  = entry_sol * (1 - sell_pct / 100)
+        open_positions[token_mint].update({
+            "amount_tokens": remain_tokens,
+            "buy_sol":       pos["buy_sol"] * (1 - sell_pct / 100),
+            "entry_sol":     max(remain_entry, 0.0001),
+        })
+        _save_positions()
+
+        await _send_tg(tg_session, base_url, chat_id,
+            f"✅ <b>SOLD {sell_pct}%</b> — {token_label}\n"
+            f"Tokens sold: {sell_tokens:,} | Remaining: {remain_tokens:,}\n"
+            f"SOL received: {expected_sol:.4f}\n"
+            f"PnL on portion: {pnl_sign}{pnl_pct:.1f}%"
+            + (f"\nSig: <code>{sell_sig}</code>" if not DRY_RUN else "")
+        )
+
+    logger.info(
+        f"[SELL BUTTON] {token_label} — {sell_pct}% sell complete | "
+        f"sig={sell_sig[:16] if sell_sig else 'N/A'}… | "
+        f"received={expected_sol:.4f} SOL"
+    )
+
+
+async def _answer_callback(
+    session: aiohttp.ClientSession,
+    base_url: str,
+    callback_id: str,
+    text: str,
+) -> None:
+    """Answer a Telegram callback query (dismiss the loading spinner on the button)."""
+    try:
+        async with session.post(
+            f"{base_url}/answerCallbackQuery",
+            json={"callback_query_id": callback_id, "text": text},
+            timeout=aiohttp.ClientTimeout(total=5),
+        ) as r:
+            r.raise_for_status()
+    except Exception as e:
+        logger.warning(f"answerCallbackQuery failed: {e}")
+
+
+async def _send_tg(
+    session: aiohttp.ClientSession,
+    base_url: str,
+    chat_id: str,
+    text: str,
+) -> None:
+    """Send a plain Telegram message via an existing aiohttp session."""
+    try:
+        async with session.post(
+            f"{base_url}/sendMessage",
+            json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as r:
+            r.raise_for_status()
+    except Exception as e:
+        logger.warning(f"_send_tg failed: {e}")
+
+
+async def _send_tg_with_buttons(
+    session: aiohttp.ClientSession,
+    base_url: str,
+    chat_id: str,
+    text: str,
+    inline_keyboard: list[list[dict]],
+) -> None:
+    """Send a Telegram message with inline keyboard via an existing aiohttp session."""
+    try:
+        async with session.post(
+            f"{base_url}/sendMessage",
+            json={
+                "chat_id":      chat_id,
+                "text":         text,
+                "parse_mode":   "HTML",
+                "reply_markup": {"inline_keyboard": inline_keyboard},
+            },
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as r:
+            r.raise_for_status()
+    except Exception as e:
+        logger.warning(f"_send_tg_with_buttons failed: {e}")
+
+
+async def _edit_message_with_buttons(
+    session: aiohttp.ClientSession,
+    base_url: str,
+    chat_id: str,
+    message_id: int,
+    text: str,
+    inline_keyboard: list[list[dict]],
+) -> None:
+    """Edit an existing Telegram message in place, preserving inline keyboard."""
+    try:
+        async with session.post(
+            f"{base_url}/editMessageText",
+            json={
+                "chat_id":      chat_id,
+                "message_id":   message_id,
+                "text":         text,
+                "parse_mode":   "HTML",
+                "reply_markup": {"inline_keyboard": inline_keyboard},
+            },
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as r:
+            r.raise_for_status()
+    except Exception as e:
+        logger.warning(f"editMessageText failed: {e}")
+
+
+def _build_position_message(
+    token_mint: str,
+    pos: dict,
+    mc_now: float,
+    mc_source: str,
+    num_emoji: str = "",
+    sol_usd: float = 0.0,
+) -> str:
+    """
+    Build a position card message used by both buy alert refresh and /holdings.
+    Returns formatted HTML string.
+    """
+    entry_sol = pos.get("entry_sol", 0.0)
+    mc_entry  = pos.get("mc_entry", 0.0)
+    tl        = pos.get("token_label") or token_mint[:8]
+    whale     = (pos.get("whale") or "?").upper()
+    tp1_hit   = pos.get("min_target_hit", False)
+    buy_sol   = pos.get("buy_sol", 0.0)
+    swap_sig  = pos.get("swap_sig", "")
+
+    # Hard sell MC
+    hard_sell_mc = mc_entry * 0.65 if mc_entry else 0
+    hard_sell_str = f" | Hard Sell MC: {_fmt_usd(hard_sell_mc)} (\u221235%)" if mc_entry else ""
+    mc_entry_str = _fmt_usd(mc_entry) if mc_entry else "\u2014"
+
+    # PnL and worth
+    if mc_entry and mc_now:
+        pnl_pct   = (mc_now - mc_entry) / mc_entry * 100
+        worth_sol = entry_sol * (mc_now / mc_entry)
+    else:
+        pnl_pct   = 0.0
+        worth_sol = entry_sol
+
+    color    = "\U0001f7e2" if pnl_pct >= 0 else "\U0001f534"
+    pnl_sign = "+" if pnl_pct >= 0 else ""
+    tp1_icon = "\u2705" if tp1_hit else "\u274c"
+
+    mc_now_str = _fmt_usd(mc_now) if mc_now else "\u2014"
+
+    # Format entry and worth with optional USD
+    if sol_usd:
+        entry_str = f"{entry_sol:.4f} SOL (~{_fmt_usd(entry_sol * sol_usd)} USD)"
+        worth_str = f"~{worth_sol:.4f} SOL (~{_fmt_usd(worth_sol * sol_usd)} USD)"
+    else:
+        entry_str = f"{entry_sol:.4f} SOL"
+        worth_str = f"~{worth_sol:.4f} SOL"
+
+    prefix = f"{num_emoji} " if num_emoji else ""
+    lines = [
+        f"{prefix}<b>{tl}</b>",
+        f"   Whale: {whale}",
+        f"   MC Entry: {mc_entry_str}{hard_sell_str}",
+        f"   Current MC: {mc_now_str} {color} {pnl_sign}{pnl_pct:.0f}% (via {mc_source})",
+        f"   Entry: {entry_str} | Worth: {worth_str}",
+        f"   TP1 hit: {tp1_icon}",
+    ]
+
+    return "\n".join(lines)
+
+
+async def _handle_refresh_callback(
+    tg_session: aiohttp.ClientSession,
+    base_url: str,
+    callback_id: str,
+    cb_data: str,
+    chat_id: str,
+    message_id: int | None,
+) -> None:
+    """
+    Process a refresh button tap: refresh|<token_mint>
+    Fetches current MC and edits the original message in place.
+    """
+    parts = cb_data.split("|")
+    if len(parts) != 2:
+        return
+    _, token_mint = parts
+
+    # 10-second cooldown per mint
+    now = time.time()
+    last = _last_refresh.get(token_mint, 0.0)
+    if now - last < 10:
+        await _answer_callback(tg_session, base_url, callback_id,
+                               "\u23f3 Please wait a few seconds before refreshing")
+        return
+
+    _last_refresh[token_mint] = now
+
+    pos = open_positions.get(token_mint)
+    if not pos:
+        await _answer_callback(tg_session, base_url, callback_id,
+                               "Position not found \u2014 may already be closed.")
+        return
+
+    await _answer_callback(tg_session, base_url, callback_id,
+                           "Refreshing...")
+
+    # Fetch fresh MC
+    mc_now, mc_source = await get_current_mc(tg_session, token_mint)
+
+    # Build refreshed message
+    msg = _build_position_message(token_mint, pos, mc_now, mc_source)
+
+    if message_id:
+        await _edit_message_with_buttons(
+            tg_session, base_url, chat_id, message_id,
+            msg, _make_position_buttons(token_mint)
+        )
+    else:
+        await _send_tg(tg_session, base_url, chat_id, msg)
+
+    logger.info(
+        f"[REFRESH] {token_mint[:8]} | MC={_fmt_usd(mc_now)} via {mc_source}"
+    )
 
 
 # --- Daily summary ----------------------------------------------------
@@ -2166,11 +3521,10 @@ def startup_checks(rpc_url: str, wallet_pubkey: str) -> None:
 
     # 2. Telegram token format ------------------------------------------
     token   = os.getenv("TELEGRAM_BOT_TOKEN", "")
-    chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
     token_valid = bool(re.match(r"^\d{8,12}:[A-Za-z0-9_-]{35,}$", token))
     logger.info(
         f"Telegram token: first10={token[:10]!r}  len={len(token)}  "
-        f"format_valid={token_valid}  chat_id={chat_id!r}"
+        f"format_valid={token_valid}  chat_ids={_telegram_chat_ids}"
     )
     if not token_valid:
         logger.error(
@@ -2261,6 +3615,40 @@ async def poll_whale(
         logger.info(f"[{name}] BUY signal → {token_mint}")
         _stats["signals_detected"] += 1
 
+        # Guard 0 — panic sell check: wait 10s and confirm whale still holds
+        logger.info(f"[{name}] Waiting 10s to confirm {token_mint[:8]} isn't a panic sell...")
+        await asyncio.sleep(10)
+        _recent_sigs_raw = get_recent_signatures(rpc_url, wallet, limit=5)
+        _sold_quick = False
+        for _rentry in (_recent_sigs_raw or []):
+            _rsig = _rentry.get("signature", "") if isinstance(_rentry, dict) else _rentry
+            if _rsig == sig:
+                break
+            _rtx = get_transaction(rpc_url, _rsig)
+            if not _rtx:
+                continue
+            _meta = _rtx.get("meta") or {}
+            _pre  = {b.get("mint"): float((b.get("uiTokenAmount") or {}).get("uiAmount") or 0)
+                     for b in (_meta.get("preTokenBalances") or [])
+                     if b.get("owner") == wallet}
+            _post = {b.get("mint"): float((b.get("uiTokenAmount") or {}).get("uiAmount") or 0)
+                     for b in (_meta.get("postTokenBalances") or [])
+                     if b.get("owner") == wallet}
+            if _pre.get(token_mint, 0.0) > 0 and _post.get(token_mint, 0.0) < _pre.get(token_mint, 0.0):
+                _sold_quick = True
+                break
+        if _sold_quick:
+            logger.info(
+                f"[{name}] SKIP — {token_mint[:8]} panic sell detected within 10s "
+                f"(whale sold immediately after buying)"
+            )
+            send_telegram(
+                f"⚡ <b>PANIC SELL DETECTED</b> — <code>{token_mint[:8]}</code>\n"
+                f"Whale: <b>{name}</b>\n"
+                f"Whale bought then sold within 10s — trade skipped."
+            )
+            continue
+
         # Guard 1 — skip if we already hold this token (prevents same-cycle duplicates)
         if token_mint in open_positions:
             logger.info(
@@ -2283,7 +3671,7 @@ async def poll_whale(
             )
             continue
 
-        # --- Conviction + activity tracking ----------------------------
+        # --- Activity tracking ---------------------------------------------
         now = time.time()
 
         # Prune entries outside the 24 h activity window
@@ -2291,13 +3679,6 @@ async def poll_whale(
             (m, t) for m, t in _whale_activity[name]
             if now - t < ACTIVITY_WINDOW_SEC
         ]
-
-        # Double conviction: same mint bought by this whale in last 30 min?
-        prior_30m = [
-            (m, t) for m, t in _whale_activity[name]
-            if now - t < CONVICTION_WINDOW_SEC
-        ]
-        is_high_conviction = any(m == token_mint for m, t in prior_30m)
 
         # Record current buy, then recount
         _whale_activity[name].append((token_mint, now))
@@ -2326,39 +3707,78 @@ async def poll_whale(
         # Fail-open: (None, False) means pump.fun unreachable or token not on pump.fun.
         prebond_pct, is_graduated = await fetch_prebond_progress(session, token_mint)
         prebond_buy_sol: float | None = None  # set to override BUY_AMOUNT_SOL for prebond entries
+        pump_data:       dict | None  = None  # populated for pre-graduation coins
         # ----------------------------------------------------------------
 
-        # --- DexScreener quality check ---------------------------------
-        if (MANNOS_AUTOPILOT and name == "mannos") or name == "mr.putin":
+        # --- Quality gate — always try PumpFun first; fall back to DexScreener ---
+        # PumpFun is checked for ALL wallets first since 90% of signals are
+        # pre-graduation coins not yet on DexScreener. DexScreener is only used
+        # as a fallback for graduated tokens.
+        _bypass_quality = (MANNOS_AUTOPILOT and name == "mannos") or name == "mr.putin"
+
+        # Step 1: Always fetch PumpFun data regardless of prebond_pct result.
+        # fetch_prebond_progress may fail even when the token IS on pump.fun,
+        # so we fetch pump_data independently to ensure Claude always has metrics.
+        if pump_data is None:
+            pump_data = await fetch_pumpfun_data(session, token_mint)
+
+        if pump_data is not None and not (pump_data.get("complete", False)):
+            # Pre-graduation coin confirmed via PumpFun — use PumpFun data
+            _prog = pump_data.get("bonding_curve_progress", prebond_pct or 0)
             logger.info(
-                f"[{name.upper()} AUTOPILOT] Bypassing DexScreener — direct entry "
-                f"({token_mint[:8]})"
+                f"[{name.upper()}] Pre-graduation ({_prog:.0f}%) "
+                f"— using PumpFun data for quality + Claude ({token_mint[:8]})"
             )
-            dex_pair = await fetch_dexscreener(session, token_mint)  # still fetch for Claude scoring
-        else:
-            dex_pair = await fetch_dexscreener(session, token_mint)
-            if dex_pair is None:
-                logger.warning(
-                    f"[{name}] DexScreener unavailable for {token_mint[:8]} "
-                    f"— proceeding (fail-open)"
-                )
-            elif prebond_pct is not None and not is_graduated:
-                # Active bonding curve: token has no AMM pool yet so DexScreener
-                # liquidity/volume will be $0 — quality check would always block it.
+            if _bypass_quality:
                 logger.info(
-                    f"[{name}] Prebond token detected — skipping DexScreener quality check "
-                    f"({token_mint[:8]})"
+                    f"[{name.upper()}] PumpFun quality check bypassed "
+                    f"({'MANNOS_AUTOPILOT' if name == 'mannos' else 'mr.putin sub-$5k'})"
                 )
             else:
-                dex_ok, dex_reason = passes_dex_quality(dex_pair)
-                if not dex_ok:
+                _ok, _reason = passes_pump_quality(pump_data)
+                if not _ok:
                     logger.info(
-                        f"[{name}] SKIP — DexScreener quality fail: {dex_reason} "
+                        f"[{name.upper()}] SKIP — PumpFun quality fail: {_reason} "
                         f"({token_mint[:8]})"
                     )
                     _stats["cancelled_dexscreener"] += 1
                     continue
-                logger.info(f"[{name}] DexScreener OK — {dex_reason}")
+                logger.info(f"[{name.upper()}] PumpFun quality OK — {_reason}")
+            dex_pair = None  # no DexScreener pair for pre-graduation coins
+        elif prebond_pct is not None and not is_graduated:
+            # PumpFun data fetch failed but prebond_progress says pre-graduation
+            # Fail-open: skip quality check rather than falling to DexScreener
+            # (DexScreener always shows $0 liquidity for pre-grad coins)
+            logger.info(
+                f"[{name.upper()}] Pre-grad ({prebond_pct:.0f}%) but PumpFun data "
+                f"unavailable — fail-open, skipping quality check ({token_mint[:8]})"
+            )
+            dex_pair = None
+        else:
+            # Graduated or PumpFun unavailable — fall back to DexScreener
+            pump_data = None  # don't pass stale pump_data to Claude for graduated coins
+            dex_pair = await fetch_dexscreener(session, token_mint)
+            if dex_pair:
+                if _bypass_quality:
+                    logger.info(
+                        f"[{name.upper()}] DexScreener quality check bypassed "
+                        f"({'MANNOS_AUTOPILOT' if name == 'mannos' else 'mr.putin sub-$5k'})"
+                    )
+                else:
+                    _ok, _reason = passes_dex_quality(dex_pair)
+                    if not _ok:
+                        logger.info(
+                            f"[{name.upper()}] SKIP — DexScreener quality fail: {_reason} "
+                            f"({token_mint[:8]})"
+                        )
+                        _stats["cancelled_dexscreener"] += 1
+                        continue
+                    logger.info(f"[{name.upper()}] DexScreener quality OK — {_reason}")
+            else:
+                logger.info(
+                    f"[{name.upper()}] DexScreener unavailable — fail-open, proceeding "
+                    f"({token_mint[:8]})"
+                )
         # ----------------------------------------------------------------
 
         # --- MR.PUTIN mcap gate ----------------------------------------
@@ -2427,13 +3847,7 @@ async def poll_whale(
             )
         # ----------------------------------------------------------------
 
-        # --- Entry quote (immediate — no delay) ------------------------
-        entry_quote = await get_jupiter_quote(
-            session, token_mint, int(BUY_AMOUNT_SOL * 1_000_000_000)
-        )
-        if not entry_quote:
-            logger.error(f"[{name}] SKIP — entry quote failed for {token_mint[:8]}")
-            continue
+        # (Entry quote is fetched at the swap site after sizing — see routing block below)
         # ----------------------------------------------------------------
 
         # --- Claude confidence scoring ---------------------------------
@@ -2453,7 +3867,8 @@ async def poll_whale(
                 token_mint,
                 dex_pair,
                 prebond_pct,   # None if not a pump.fun token or if graduated
-                f"whale={name} signal, conviction={'high' if is_high_conviction else 'normal'}",
+                f"whale={name} signal",
+                pump_data=pump_data,
             )
             _whale_approved = claude_score >= WHALE_MIN_SCORE
             _whale_label    = _token_label(token_mint, dex_pair)
@@ -2481,7 +3896,7 @@ async def poll_whale(
             )
         # ----------------------------------------------------------------
 
-        # --- Position sizing — mr.putin > prebond > conviction > normal ---
+        # --- Position sizing — mr.putin > prebond > normal ----------------
         if name == "mr.putin":
             buy_sol = round(sol_balance * MRPUTIN_CONFIG["position_size_pct"], 4)
             logger.info(
@@ -2490,32 +3905,41 @@ async def poll_whale(
                 f"time stop {MRPUTIN_CONFIG['time_stop_mins']}m"
             )
         elif prebond_buy_sol is not None:
-            # Prebond entry: fixed 2% of balance (no conviction multiplier on prebond)
             buy_sol = prebond_buy_sol
             logger.info(f"[{name}] Prebond position size: {buy_sol} SOL (2% of balance)")
-        elif is_high_conviction:
-            buy_sol = round(BUY_AMOUNT_SOL * CONVICTION_MULTIPLIER, 4)
-            logger.info(
-                f"[{name.upper()}] HIGH CONVICTION sizing confirmed — "
-                f"{buy_sol} SOL ({CONVICTION_MULTIPLIER}x normal)"
-            )
         else:
             buy_sol = BUY_AMOUNT_SOL
         # ----------------------------------------------------------------
 
-        # Use entry quote for normal size; re-fetch for non-standard sizes
-        if buy_sol == BUY_AMOUNT_SOL:
-            quote = entry_quote
-        else:
-            amount_lamports = int(buy_sol * 1_000_000_000)
-            quote = await get_jupiter_quote(session, token_mint, amount_lamports)
-            if not quote:
-                logger.error(
-                    f"[{name}] SKIP — conviction-sized quote failed for {token_mint[:8]}"
+        # Determine MC for routing — use pump_data or dex_pair, live lookup if both missing
+        _buy_mc = float((pump_data or {}).get("usd_market_cap") or 0) or \
+                  float((dex_pair or {}).get("marketCap") or (dex_pair or {}).get("fdv") or 0)
+        if _buy_mc <= 0:
+            _buy_mc, _mc_src = await get_current_mc(session, token_mint)
+            if _buy_mc > 0:
+                logger.info(
+                    f"[{name.upper()}] MC=${_buy_mc:,.0f} (from live lookup, {_mc_src})"
                 )
-                continue
-
-        swap_sig, swap_msg = await execute_swap(session, quote, wallet_pubkey)
+            else:
+                logger.warning(
+                    f"[{name.upper()}] MC unknown — router will default to Jupiter"
+                )
+        # --- Mint suffix routing: non-"pump" mints are likely on Raydium already ---
+        if not token_mint.endswith("pump"):
+            logger.info(
+                f"[{name.upper()}] Mint does not end in 'pump' — skipping PumpFun, "
+                f"routing directly to Jupiter ({token_mint[:8]})"
+            )
+            _amount_lamports = int(buy_sol * 1_000_000_000)
+            _jup_quote = await get_jupiter_quote(session, token_mint, _amount_lamports)
+            if _jup_quote:
+                swap_sig, swap_msg = await execute_swap(session, _jup_quote, wallet_pubkey)
+            else:
+                swap_sig, swap_msg = None, "Jupiter quote failed (non-pump mint)"
+        else:
+            swap_sig, swap_msg = await execute_buy_routed(
+                session, token_mint, buy_sol, wallet_pubkey, _buy_mc
+            )
 
         if not swap_sig:
             logger.error(
@@ -2530,19 +3954,10 @@ async def poll_whale(
             )
             continue
 
-        # High conviction gets its own priority Telegram alert first
         token_label = _token_label(token_mint, dex_pair)
         mc_entry    = float(
             (dex_pair or {}).get("marketCap") or (dex_pair or {}).get("fdv") or 0
         )
-        if is_high_conviction:
-            send_telegram(
-                f"🔥 <b>HIGH CONVICTION</b> — [{name.upper()}] bought "
-                f"<code>{token_label}</code> twice in 30 mins\n"
-                f"Position size: {buy_sol} SOL ({CONVICTION_MULTIPLIER}x normal)"
-            )
-
-        conviction_badge = "🔥 HIGH CONVICTION\n" if is_high_conviction else ""
         mc_entry_str     = _fmt_usd(mc_entry) if mc_entry else "—"
 
         if mc_entry:
@@ -2575,23 +3990,33 @@ async def poll_whale(
                 )
         else:
             tp_block = ""
+
+        hard_sell_mc = mc_entry * 0.65 if mc_entry else 0
+        hard_sell_str = f" | Hard Sell MC: {_fmt_usd(hard_sell_mc)} (\u221235%)" if mc_entry else ""
+
         msg = (
-            f"🐋 <b>APEX WHALE COPY</b> [{name.upper()}]\n"
-            f"{conviction_badge}"
+            f"\U0001f40b <b>APEX WHALE COPY</b> [{name.upper()}]\n"
             f"Token: <code>{token_label}</code>\n"
             f"Amount: {buy_sol} SOL\n"
-            f"MC Entry: {mc_entry_str}\n"
+            f"MC Entry: {mc_entry_str}{hard_sell_str}\n"
             f"Whale: <code>{name.upper()}</code>\n"
             f"Our sig: <code>{swap_sig}</code>"
             f"{tp_block}"
         )
         logger.info(msg)
-        send_telegram(msg)
+        send_telegram_with_buttons(msg, _make_position_buttons(token_mint))
 
         # --- Register open position for sell monitoring ----------------
-        token_units = int(quote.get("outAmount", 0))
-        entry_sol   = int(quote.get("inAmount",  0)) / 1_000_000_000
-        if token_units > 0:
+        # No quote object in routed flow — use buy_sol as entry, fetch
+        # live on-chain token balance to get accurate amount_tokens.
+        entry_sol = buy_sol
+        try:
+            token_units = await get_spl_token_balance(session, token_mint, wallet_pubkey)
+        except Exception as exc:
+            logger.warning(f"[{token_mint[:8]}] SPL balance fetch failed: {exc} — saving with 0")
+            token_units = 0
+
+        try:
             open_positions[token_mint] = {
                 "entry_time":    time.time(),
                 "entry_sol":     entry_sol,
@@ -2610,9 +4035,19 @@ async def poll_whale(
                 f"[{token_mint[:8]}] Position opened — "
                 f"{token_units:,} tokens | entry {entry_sol:.4f} SOL"
             )
-            _stats["trades_executed"] += 1
-            # Emergency dump check fires 5s after buy — non-blocking — Fix 4
-            asyncio.create_task(emergency_dump_check(session, token_mint, wallet_pubkey))
+        except Exception as exc:
+            logger.error(
+                f"[{token_mint[:8]}] CRITICAL — position save failed: {exc} "
+                f"(buy was successful, sig={swap_sig})"
+            )
+            send_telegram(
+                f"🚨 <b>POSITION SAVE FAILED</b>\n"
+                f"Token: {token_label}\n"
+                f"Buy sig: <code>{swap_sig}</code>\n"
+                f"Manual intervention needed!"
+            )
+        _stats["trades_executed"] += 1
+        asyncio.create_task(emergency_dump_check(session, token_mint, wallet_pubkey))
         # ---------------------------------------------------------------
 
 
@@ -2651,11 +4086,33 @@ async def whale_poll_loop(
 
 
 async def run():
-    global _rpc_url
+    global _rpc_url, _wallet_keypair
     rpc_url       = os.getenv("SOLANA_RPC", "")
     wallet_pubkey = os.getenv("WALLET_PUBLIC_KEY", "")   # base58 address — for balance checks + Jupiter
-    wallet_key    = os.getenv("WALLET_PRIVATE_KEY", "")  # byte array    — for tx signing (live mode only)
+    wallet_key    = os.getenv("WALLET_PRIVATE_KEY", "")  # base58 or JSON byte array — for tx signing
     _rpc_url      = rpc_url                              # module-level — used by confirm_transaction()
+
+    # Load wallet keypair for PumpFun transaction signing (skipped in DRY_RUN)
+    if wallet_key and not DRY_RUN:
+        try:
+            # Support three formats:
+            #   1. JSON byte-array:         [228,29,168,...]
+            #   2. Bare comma-separated:    228, 29, 168, ...
+            #   3. Base58 string:           4dZ7a...
+            stripped = wallet_key.strip()
+            if stripped.startswith("["):
+                key_bytes = bytes(json.loads(stripped))
+                _wallet_keypair = SoldersKeypair.from_bytes(key_bytes)
+            elif "," in stripped:
+                key_bytes = bytes(int(b.strip()) for b in stripped.split(",") if b.strip())
+                _wallet_keypair = SoldersKeypair.from_bytes(key_bytes)
+            else:
+                _wallet_keypair = SoldersKeypair.from_base58_string(stripped)
+            logger.info(f"Wallet keypair loaded — pubkey: {str(_wallet_keypair.pubkey())[:12]}…")
+        except Exception as exc:
+            logger.error(f"Failed to load wallet keypair from WALLET_PRIVATE_KEY: {exc}")
+    elif not DRY_RUN:
+        logger.warning("WALLET_PRIVATE_KEY not set — PumpFun buys will fail in live mode")
 
     if not rpc_url:
         logger.error("SOLANA_RPC not set — exiting")
@@ -2706,6 +4163,212 @@ async def run():
             telegram_command_loop(),
             dip_sniper_loop(session, wallet_pubkey),
         )
+
+
+# --- External signal API ---------------------------------------------------
+# handle_cto_signal() is called directly by DexAlert scanner
+
+
+async def handle_cto_signal(
+    session: aiohttp.ClientSession,
+    token_mint: str,
+    token_name: str,
+    token_symbol: str,
+    rpc_url: str,
+    wallet_pubkey: str,
+) -> None:
+    """
+    Entry point for DexAlert CTO verified signals.
+    Runs the full Apex pipeline: quality check -> safety -> Claude -> buy.
+    """
+    PREFIX = "[CTO SIGNAL]"
+
+    # Step 1 — Duplicate check
+    if token_mint in open_positions:
+        logger.info(f"{PREFIX} {token_symbol} already in open_positions — skipping")
+        return
+    if token_mint in _token_blacklist and _token_blacklist[token_mint] > time.time():
+        logger.info(f"{PREFIX} {token_symbol} is blacklisted — skipping")
+        return
+
+    # Step 2 — Balance check
+    sol_balance = get_sol_balance(rpc_url, wallet_pubkey)
+    if sol_balance < LOW_BALANCE_SOL:
+        logger.warning(
+            f"{PREFIX} SOL balance {sol_balance:.4f} below minimum "
+            f"{LOW_BALANCE_SOL} — skipping"
+        )
+        return
+
+    # Step 3 — Quality check (fail-open)
+    dex_pair: dict | None = None
+    pump_data: dict | None = None
+    prebond_pct: float | None = None
+    is_graduated = False
+
+    try:
+        prebond_pct, is_graduated = await fetch_prebond_progress(session, token_mint)
+    except Exception as e:
+        logger.warning(f"{PREFIX} fetch_prebond_progress failed: {e} — fail-open")
+
+    if not is_graduated:
+        # Pre-graduation — use PumpFun quality check
+        try:
+            pump_data = await fetch_pumpfun_data(session, token_mint)
+            if pump_data:
+                ok, reason = passes_pump_quality(pump_data)
+                if not ok:
+                    logger.info(f"{PREFIX} Pump quality fail: {reason} — skipping")
+                    return
+        except Exception as e:
+            logger.warning(f"{PREFIX} PumpFun quality check failed: {e} — fail-open")
+    else:
+        # Graduated — use DexScreener quality check
+        try:
+            dex_pair = await fetch_dexscreener(session, token_mint)
+            if dex_pair:
+                ok, reason = passes_dex_quality(dex_pair)
+                if not ok:
+                    logger.info(f"{PREFIX} Dex quality fail: {reason} — skipping")
+                    return
+        except Exception as e:
+            logger.warning(f"{PREFIX} DexScreener quality check failed: {e} — fail-open")
+
+    # Step 4 — Safety check
+    try:
+        safe, safety_msg = await check_token_safety(
+            session, token_mint, rpc_url, whale_name="cto_signal", dex_pair=dex_pair
+        )
+        if not safe:
+            logger.info(f"{PREFIX} Safety fail: {safety_msg} — blacklisting + skipping")
+            _token_blacklist[token_mint] = time.time() + BLACKLIST_MINUTES * 60
+            return
+    except Exception as e:
+        logger.warning(f"{PREFIX} Safety check failed: {e} — fail-open")
+
+    # Step 5 — Claude scoring
+    try:
+        claude_score, bullets = await get_claude_score(
+            token_mint,
+            dex_pair=dex_pair,
+            prebond_progress=prebond_pct,
+            context_note="cto_signal=DexAlert verified CTO",
+            pump_data=pump_data,
+        )
+    except Exception as e:
+        logger.warning(f"{PREFIX} Claude scoring failed: {e} — fail-open at 70")
+        claude_score, bullets = 70, None
+
+    if claude_score < WHALE_MIN_SCORE:
+        logger.info(
+            f"{PREFIX} Claude score {claude_score} below min {WHALE_MIN_SCORE} — NO-GO"
+        )
+        return
+
+    # Step 6 — Execute buy
+    buy_sol = CTO_SIGNAL_BUY_SOL
+
+    if DRY_RUN:
+        logger.info(
+            f"{PREFIX} [DRY RUN] Would buy {buy_sol} SOL of {token_symbol} "
+            f"({token_mint[:8]}) — Claude: {claude_score}"
+        )
+        send_telegram(
+            f"🔵 {PREFIX} <b>[DRY RUN]</b> Would buy {token_symbol}\n"
+            f"Mint: <code>{token_mint[:8]}</code>...\n"
+            f"Size: {buy_sol} SOL\n"
+            f"Claude: {claude_score}/100\n"
+            f"Source: DexAlert verified CTO"
+        )
+        return
+
+    # Determine MC for routing — live lookup if local data missing
+    _cto_mc = float((pump_data or {}).get("usd_market_cap") or 0) or \
+              float((dex_pair or {}).get("marketCap") or (dex_pair or {}).get("fdv") or 0)
+    if _cto_mc <= 0:
+        _cto_mc, _mc_src = await get_current_mc(session, token_mint)
+        if _cto_mc > 0:
+            logger.info(
+                f"{PREFIX} MC=${_cto_mc:,.0f} (from live lookup, {_mc_src})"
+            )
+        else:
+            logger.warning(
+                f"{PREFIX} MC unknown — router will default to Jupiter"
+            )
+    swap_sig, swap_msg = await execute_buy_routed(
+        session, token_mint, buy_sol, wallet_pubkey, _cto_mc
+    )
+
+    if not swap_sig:
+        logger.error(f"{PREFIX} Buy failed: {swap_msg} — position NOT opened")
+        send_telegram(
+            f"⚠️ {PREFIX} <b>TX FAILED</b> — {token_symbol}\n"
+            f"Mint: <code>{token_mint[:8]}</code>\n"
+            f"Reason: {swap_msg}"
+        )
+        return
+
+    # Step 7 — Record position
+    token_label = _token_label(token_mint, dex_pair)
+    mc_entry = float(
+        (dex_pair or {}).get("marketCap") or (dex_pair or {}).get("fdv") or 0
+    )
+
+    entry_sol = buy_sol
+    try:
+        token_units = await get_spl_token_balance(session, token_mint, wallet_pubkey)
+    except Exception as exc:
+        logger.warning(f"{PREFIX} SPL balance fetch failed: {exc} — saving with 0")
+        token_units = 0
+
+    try:
+        open_positions[token_mint] = {
+            "entry_time":     time.time(),
+            "entry_sol":      entry_sol,
+            "peak_sol":       entry_sol,
+            "amount_tokens":  token_units,
+            "whale":          "cto_signal",
+            "buy_sol":        buy_sol,
+            "claude_score":   claude_score,
+            "min_target_hit": False,
+            "source":         "cto_signal",
+            "mc_entry":       mc_entry,
+            "token_label":    token_label,
+        }
+        _save_positions()
+        logger.info(
+            f"{PREFIX} Position opened — {token_symbol} | "
+            f"{token_units:,} tokens | entry {entry_sol:.4f} SOL"
+        )
+    except Exception as exc:
+        logger.error(
+            f"{PREFIX} CRITICAL — position save failed: {exc} "
+            f"(buy was successful, sig={swap_sig})"
+        )
+        send_telegram(
+            f"🚨 <b>POSITION SAVE FAILED</b>\n"
+            f"Token: {token_label}\n"
+            f"Buy sig: <code>{swap_sig}</code>\n"
+            f"Manual intervention needed!"
+        )
+    _stats["trades_executed"] += 1
+    asyncio.create_task(emergency_dump_check(session, token_mint, wallet_pubkey))
+
+    # Step 8 — Telegram alert with sell buttons
+    _cto_hard_sell_mc = mc_entry * 0.65 if mc_entry else 0
+    _cto_hard_sell_str = f" | Hard Sell MC: {_fmt_usd(_cto_hard_sell_mc)} (\u221235%)" if mc_entry else ""
+    _cto_mc_str = _fmt_usd(mc_entry) if mc_entry else "\u2014"
+
+    _cto_msg = (
+        f"\U0001f3af {PREFIX} <b>Bought {token_symbol}</b>\n"
+        f"Mint: <code>{token_mint[:8]}</code>...\n"
+        f"Size: {buy_sol} SOL\n"
+        f"MC Entry: {_cto_mc_str}{_cto_hard_sell_str}\n"
+        f"Claude: {claude_score}/100\n"
+        f"Source: DexAlert verified CTO\n"
+        f"Sig: <code>{swap_sig}</code>"
+    )
+    send_telegram_with_buttons(_cto_msg, _make_position_buttons(token_mint))
 
 
 if __name__ == "__main__":

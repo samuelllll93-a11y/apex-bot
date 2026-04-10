@@ -33,7 +33,7 @@ ALLOWED_DEX_IDS  = {"raydium", "pump", "pumpswap", "pumpfun", "meteora", "meteor
 
 DRY_RUN          = os.getenv("DRY_RUN", "True").lower() == "true"
 BUY_AMOUNT_SOL   = float(os.getenv("BUY_AMOUNT_SOL", "0.1"))
-MAX_SLIPPAGE_BPS = int(os.getenv("MAX_SLIPPAGE_BPS", "300"))
+MAX_SLIPPAGE_BPS = int(os.getenv("MAX_SLIPPAGE_BPS", "2000"))
 SOL_MINT         = "So11111111111111111111111111111111111111112"
 
 # Rough filter thresholds — liquidity is time-gated (peak vs off-peak UTC)
