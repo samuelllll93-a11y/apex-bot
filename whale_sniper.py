@@ -78,6 +78,14 @@ PREFER_JUPITER_SELLS  = True   # Jupiter first for sells; PumpPortal as fallback
 # recovered. Tune via config.
 HARD_FLOOR_PCT     = -35.0
 HARD_FLOOR_ENABLED = True
+
+# Max hold time — secondary safety net beyond the hard floor. Force-exit
+# any open position older than MAX_HOLD_MINUTES regardless of source or
+# PnL state. Catches the slow-bleed scenario where a position drifts at
+# -20% for hours, never deep enough to trigger the hard floor but also
+# never recovering to TP1. Applies to whale_copy, momentum_scanner,
+# cto_signal, dip_sniper, and cluster_buy positions identically.
+MAX_HOLD_MINUTES   = 180   # 3 hours
 PRIORITY_FEE_LAMPORTS = int(os.getenv("PRIORITY_FEE_LAMPORTS", "100000"))
 
 TX_CONFIRM_TIMEOUT_SEC = 30   # give up on confirmation after this many seconds
@@ -1837,6 +1845,20 @@ def _hybrid_trail_pct(pos: dict) -> float:
     return HYBRID_PREGRAD_TRAIL_PCT if pos.get("was_pregrad", False) else HYBRID_GRADUATED_TRAIL_PCT
 
 
+def _max_hold_check(elapsed_min: float) -> str | None:
+    """Max-hold safety net. Returns an exit reason string when the position
+    has been open longer than MAX_HOLD_MINUTES; otherwise None.
+
+    Source-agnostic by signature. Applies after TP1 (post-TP1 positions
+    eventually get cut even if the trail never trips) and before the
+    trail-armed gate (pre-TP1 positions that survived the hard floor at
+    e.g. -20% to -34% get cut after 3 hours rather than rotting).
+    """
+    if elapsed_min >= MAX_HOLD_MINUTES:
+        return f"MAX HOLD ({elapsed_min:.0f}m >= {MAX_HOLD_MINUTES}m)"
+    return None
+
+
 def _hard_floor_check(pnl_pct: float, min_target_hit: bool) -> str | None:
     """Pre-TP1 hard floor exit decision. Returns an exit reason string when
     the position has dropped past HARD_FLOOR_PCT from entry and TP1 has
@@ -3378,6 +3400,88 @@ async def check_and_maybe_exit(
         )
         return   # re-evaluate remaining position fresh next tick
     # ----------------------------------------------------------------------
+
+    # --- Max hold time-stop (3hr) --------------------------------------
+    # Cuts any position older than MAX_HOLD_MINUTES regardless of source
+    # or PnL state. This is the secondary safety net beyond the hard
+    # floor — catches slow-bleed positions that drift at -20% for hours
+    # without ever deep-dumping to trigger hard floor, and also harvests
+    # post-TP1 remainders whose trail never trips.
+    _mh_exit_reason = _max_hold_check(elapsed_min)
+    if _mh_exit_reason is not None:
+        _mh_label = pos.get("token_label") or token_mint[:8]
+        _mh_symbol = pos.get("token_symbol") or _mh_label
+        _mh_live_tokens = await get_spl_token_balance(session, token_mint, wallet_pubkey)
+        if _mh_live_tokens <= 0:
+            logger.warning(
+                f"[{token_mint[:8]}] on-chain balance is 0 — aborting max hold "
+                f"sell (trigger: {_mh_exit_reason})"
+            )
+            send_telegram(
+                f"⚠️ <b>MAX HOLD ABORTED</b> — {_mh_label}\n"
+                f"CA: <code>{token_mint}</code>\n"
+                f"Trigger: {_mh_exit_reason}\n"
+                f"Wallet shows no token balance on-chain"
+            )
+            return
+        open_positions[token_mint]["amount_tokens"] = _mh_live_tokens
+        _save_positions()
+
+        if DRY_RUN:
+            _mh_sig = "DRY_RUN_MAX_HOLD_SIG"
+            logger.info(
+                f"[DRY RUN] max_hold_exit would sell {_mh_live_tokens:,} → "
+                f"~{current_sol:.4f} SOL ({_mh_exit_reason})"
+            )
+        else:
+            _mh_sig, _mh_msg = await execute_sell_routed(
+                session, token_mint, _mh_live_tokens, wallet_pubkey, mc_now
+            )
+            if not _mh_sig:
+                _mh_fc = _sell_failure_counts.get(token_mint, 0) + 1
+                _sell_failure_counts[token_mint] = _mh_fc
+                logger.error(
+                    f"[{token_mint[:8]}] max hold sell failed ({_mh_msg}) — "
+                    f"attempt {_mh_fc}/{SELL_ABANDON_AFTER_FAILURES}. "
+                    f"Trigger was: {_mh_exit_reason}"
+                )
+                _apex_log_error(
+                    token_mint, pos.get("whale_name") or pos.get("whale"),
+                    "max_hold_sell_failed",
+                    {"msg": _mh_msg, "trigger": _mh_exit_reason, "attempt": _mh_fc},
+                )
+                if _mh_fc >= SELL_ABANDON_AFTER_FAILURES:
+                    _abandon_unsellable_position(
+                        pos, token_mint, _mh_msg,
+                        exit_reason=_mh_exit_reason,
+                    )
+                    return
+                return  # retry next tick
+
+        # Successful sell — finalize via shared helper. No blacklist:
+        # max_hold is a time-based safety net, not a "bad token" signal.
+        # A position closed at 3hr might still be a fine re-entry candidate
+        # if it sets up cleanly later.
+        _mh_real_sol, _mh_real_pct = _finalize_successful_exit(
+            pos, token_mint, current_sol, "max_hold_exit",
+            blacklist=False,
+        )
+        _mh_sign = "+" if _mh_real_pct >= 0 else ""
+        logger.info(
+            f"[{token_mint[:8]}] max_hold_exit sig={_mh_sig} | "
+            f"hold {elapsed_min:.0f}m | real PnL: "
+            f"{_mh_sign}{_mh_real_pct:.1f}% ({_mh_sign}{_mh_real_sol:.4f} SOL)"
+        )
+        send_telegram(
+            f"⏱️ <b>MAX HOLD</b> — {_mh_symbol} hit 3hr max hold — "
+            f"exiting at {_mh_sign}{_mh_real_pct:.1f}%\n"
+            f"CA: <code>{token_mint}</code>\n"
+            f"Trigger: {_mh_exit_reason}\n"
+            f"Realised PnL: {_mh_sign}{_mh_real_pct:.1f}% "
+            f"({_mh_sign}{_mh_real_sol:.4f} SOL)"
+        )
+        return
+    # --- END MAX HOLD --------------------------------------------------
 
     # --- Hybrid primary exit: trailing stop only ----------------------
     # Trailing stop is ARMED only after TP1 fires (min_target_hit=True).
