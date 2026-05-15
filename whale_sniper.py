@@ -2818,6 +2818,102 @@ def send_telegram_with_buttons(
 
 # --- Position exit logic ----------------------------------------------
 
+def _abandon_unsellable_position(
+    pos: dict,
+    token_mint: str,
+    sell_msg: str,
+    *,
+    abandon_qualifier: str = "",
+    exit_reason: str = "",
+) -> None:
+    """Finalize an unsellable position after SELL_ABANDON_AFTER_FAILURES
+    consecutive sell failures. Logs the trade as 'abandoned_unsellable',
+    removes the position, blacklists the token, updates daily stats with
+    realised PnL (computed against exit_sol = 0 so any prior TP1 / mirror
+    proceeds still count via _real_pnl), and sends the abandonment alert.
+
+    abandon_qualifier is a path-specific phrase interpolated into the
+    user-facing messages — "whale_full_exit" for the whale-exit path so
+    the message reads "consecutive whale_full_exit sell failures", "" for
+    the generic trailing-stop / hard-floor / max-hold paths.
+
+    exit_reason is the trigger string that originally fired the sell;
+    included in the structured warning log when present, omitted when "".
+    """
+    _exit_label = pos.get("token_label") or token_mint[:8]
+    abn_real_sol, abn_real_pct = _real_pnl(pos, 0.0)
+    _log_trade(pos, "abandoned_unsellable", 0.0, token_mint)
+    del open_positions[token_mint]
+    _save_positions()
+    _mark_token_traded(token_mint)
+    _token_blacklist[token_mint] = time.time() + BLACKLIST_MINUTES * 60
+    _save_blacklist()
+    _sell_failure_counts.pop(token_mint, None)
+    if abn_real_pct >= 0:
+        _stats["wins"] += 1
+    else:
+        _stats["losses"] += 1
+    _stats["net_pnl_sol"] = round(_stats["net_pnl_sol"] + abn_real_sol, 6)
+    _record_trade(abn_real_sol)
+    sign = "+" if abn_real_pct >= 0 else ""
+    qualifier_phrase = f"{abandon_qualifier} " if abandon_qualifier else ""
+    send_telegram(
+        f"🗑 <b>POSITION ABANDONED</b> — {_exit_label}\n"
+        f"CA: <code>{token_mint}</code>\n"
+        f"Reason: unsellable after {SELL_ABANDON_AFTER_FAILURES} "
+        f"consecutive {qualifier_phrase}sell failures\n"
+        f"Last error: {sell_msg[:200]}\n"
+        f"Final PnL: {sign}{abn_real_pct:.1f}% "
+        f"({sign}{abn_real_sol:.4f} SOL)\n"
+        f"Token blacklisted for {BLACKLIST_MINUTES}min."
+    )
+    trigger_phrase = f"| trigger was: {exit_reason} " if exit_reason else ""
+    logger.warning(
+        f"[{token_mint[:8]}] ABANDONED after "
+        f"{SELL_ABANDON_AFTER_FAILURES} consecutive "
+        f"{qualifier_phrase}sell failures {trigger_phrase}| real PnL: "
+        f"{sign}{abn_real_pct:.1f}%"
+    )
+
+
+def _finalize_successful_exit(
+    pos: dict,
+    token_mint: str,
+    current_sol: float,
+    log_reason: str,
+    *,
+    blacklist: bool,
+) -> tuple[float, float]:
+    """Shared housekeeping after a successful exit sell. Computes realised
+    PnL via _real_pnl (accounts for prior TP1 / partial-mirror proceeds),
+    writes the trade record, removes the position from open_positions,
+    marks the token as traded, optionally blacklists it (trailing-stop
+    exits blacklist; whale-full-exit and hard-floor / max-hold do not),
+    updates daily stats, resets the per-position sell-failure counter, and
+    records the trade for the rolling PnL window.
+
+    Returns (real_pnl_sol, real_pnl_pct) so callers can compose their own
+    Telegram message — success messages differ enough between paths
+    (whale dump vs trade summary) that they stay bespoke at the call site.
+    """
+    _sell_failure_counts.pop(token_mint, None)
+    real_pnl_sol, real_pnl_pct = _real_pnl(pos, current_sol)
+    _log_trade(pos, log_reason, current_sol, token_mint)
+    del open_positions[token_mint]
+    _save_positions()
+    _mark_token_traded(token_mint)
+    if blacklist:
+        _token_blacklist[token_mint] = time.time() + BLACKLIST_MINUTES * 60
+        _save_blacklist()
+    if real_pnl_pct >= 0:
+        _stats["wins"] += 1
+    else:
+        _stats["losses"] += 1
+    _stats["net_pnl_sol"] = round(_stats["net_pnl_sol"] + real_pnl_sol, 6)
+    _record_trade(real_pnl_sol)
+    return real_pnl_sol, real_pnl_pct
+
+
 async def check_and_maybe_exit(
     session: aiohttp.ClientSession,
     token_mint: str,
@@ -2991,39 +3087,9 @@ async def check_and_maybe_exit(
                         {"msg": _wfe_msg, "attempt": _wfe_fc},
                     )
                     if _wfe_fc >= SELL_ABANDON_AFTER_FAILURES:
-                        # ABANDON — mirror the trailing-stop abandonment branch
-                        _abn_real_sol, _abn_real_pct = _real_pnl(pos, 0.0)
-                        _log_trade(pos, "abandoned_unsellable", 0.0, token_mint)
-                        del open_positions[token_mint]
-                        _save_positions()
-                        _mark_token_traded(token_mint)
-                        _token_blacklist[token_mint] = time.time() + BLACKLIST_MINUTES * 60
-                        _save_blacklist()
-                        _sell_failure_counts.pop(token_mint, None)
-                        if _abn_real_pct >= 0:
-                            _stats["wins"] += 1
-                        else:
-                            _stats["losses"] += 1
-                        _stats["net_pnl_sol"] = round(
-                            _stats["net_pnl_sol"] + _abn_real_sol, 6
-                        )
-                        _record_trade(_abn_real_sol)
-                        _abn_sign = "+" if _abn_real_pct >= 0 else ""
-                        send_telegram(
-                            f"🗑 <b>POSITION ABANDONED</b> — {_exit_label}\n"
-                            f"CA: <code>{token_mint}</code>\n"
-                            f"Reason: unsellable after {SELL_ABANDON_AFTER_FAILURES} "
-                            f"consecutive whale_full_exit sell failures\n"
-                            f"Last error: {_wfe_msg[:200]}\n"
-                            f"Final PnL: {_abn_sign}{_abn_real_pct:.1f}% "
-                            f"({_abn_sign}{_abn_real_sol:.4f} SOL)\n"
-                            f"Token blacklisted for {BLACKLIST_MINUTES}min."
-                        )
-                        logger.warning(
-                            f"[{token_mint[:8]}] ABANDONED after "
-                            f"{SELL_ABANDON_AFTER_FAILURES} consecutive "
-                            f"whale_full_exit sell failures | real PnL: "
-                            f"{_abn_sign}{_abn_real_pct:.1f}%"
+                        _abandon_unsellable_position(
+                            pos, token_mint, _wfe_msg,
+                            abandon_qualifier="whale_full_exit",
                         )
                         return
                     send_telegram(
@@ -3037,22 +3103,11 @@ async def check_and_maybe_exit(
                     _save_positions()
                     return
 
-            # Successful sell — clear any accumulated failure counter.
-            _sell_failure_counts.pop(token_mint, None)
-
-            _wfe_real_sol, _wfe_real_pct = _real_pnl(pos, current_sol)
-            _log_trade(pos, "whale_full_exit", current_sol, token_mint)
-            del open_positions[token_mint]
-            _save_positions()
-            _mark_token_traded(token_mint)
-
-            if _wfe_real_pct >= 0:
-                _stats["wins"] += 1
-            else:
-                _stats["losses"] += 1
-            _stats["net_pnl_sol"] = round(_stats["net_pnl_sol"] + _wfe_real_sol, 6)
-            _record_trade(_wfe_real_sol)
-
+            # Successful sell — finalize via shared helper.
+            _wfe_real_sol, _wfe_real_pct = _finalize_successful_exit(
+                pos, token_mint, current_sol, "whale_full_exit",
+                blacklist=False,
+            )
             _sign = "+" if _wfe_real_pct >= 0 else ""
             logger.info(f"[BUY/SELL SIG] {token_mint[:8]} whale_full_exit sig={_wfe_sig}")
             send_telegram(
@@ -3277,58 +3332,17 @@ async def check_and_maybe_exit(
                 {"msg": sell_msg, "trigger": exit_reason, "attempt": _fc},
             )
             if _fc >= SELL_ABANDON_AFTER_FAILURES:
-                # --- ABANDON: token is unsellable. Close position record,
-                # blacklist, log trade at exit_sol=0 (real PnL picks up any
-                # prior TP1/partial-mirror proceeds via _real_pnl).
-                _abandon_label = pos.get("token_label") or token_mint[:8]
-                _abn_real_sol, _abn_real_pct = _real_pnl(pos, 0.0)
-                _log_trade(pos, "abandoned_unsellable", 0.0, token_mint)
-                del open_positions[token_mint]
-                _save_positions()
-                _mark_token_traded(token_mint)
-                _token_blacklist[token_mint] = time.time() + BLACKLIST_MINUTES * 60
-                _save_blacklist()
-                _sell_failure_counts.pop(token_mint, None)
-                # Stats: treat as loss unless prior partials already netted +
-                if _abn_real_pct >= 0:
-                    _stats["wins"] += 1
-                else:
-                    _stats["losses"] += 1
-                _stats["net_pnl_sol"] = round(
-                    _stats["net_pnl_sol"] + _abn_real_sol, 6
-                )
-                _record_trade(_abn_real_sol)
-                _sign = "+" if _abn_real_pct >= 0 else ""
-                send_telegram(
-                    f"🗑 <b>POSITION ABANDONED</b> — {_abandon_label}\n"
-                    f"CA: <code>{token_mint}</code>\n"
-                    f"Reason: unsellable after {SELL_ABANDON_AFTER_FAILURES} "
-                    f"consecutive sell failures\n"
-                    f"Last error: {sell_msg[:200]}\n"
-                    f"Final PnL: {_sign}{_abn_real_pct:.1f}% "
-                    f"({_sign}{_abn_real_sol:.4f} SOL)\n"
-                    f"Token blacklisted for {BLACKLIST_MINUTES}min."
-                )
-                logger.warning(
-                    f"[{token_mint[:8]}] ABANDONED after "
-                    f"{SELL_ABANDON_AFTER_FAILURES} consecutive sell failures "
-                    f"| trigger was: {exit_reason} | real PnL: "
-                    f"{_sign}{_abn_real_pct:.1f}%"
+                _abandon_unsellable_position(
+                    pos, token_mint, sell_msg,
+                    exit_reason=exit_reason,
                 )
                 return
             return  # don't clear position if live sell tx failed — will retry next cycle
 
-    # Successful sell — clear any accumulated failure counter for this mint.
-    _sell_failure_counts.pop(token_mint, None)
-
-    # Real PnL across original cost + all partial proceeds (TP1 / partial
-    # mirror sells). Use this for display, stats, and log so a TP1'd
-    # position that trails out doesn't show +26,000%.
-    _real_pnl_sol, _real_pnl_pct = _real_pnl(pos, current_sol)
+    # Successful sell — gather display values, classify log_reason, then
+    # delegate housekeeping to _finalize_successful_exit.
     _original_entry = float(pos.get("original_entry_sol") or entry_sol or 0) or entry_sol
     _tp1_rec        = float(pos.get("tp1_received_sol") or 0.0)
-    pnl_sign = "+" if _real_pnl_pct >= 0 else ""
-    emoji    = "💰" if _real_pnl_pct >= 0 else "🛑"
 
     # Fetch exit MC for sell summary (non-blocking; fails open to "—")
     _sell_dex = await fetch_dexscreener(session, token_mint)
@@ -3336,10 +3350,9 @@ async def check_and_maybe_exit(
     mc_entry_stored  = pos.get("mc_entry", 0)
     token_label_sell = pos.get("token_label") or token_mint[:8]
 
-    # Log trade to daily-report log before clearing pos — classify reason
-    # from the human-readable exit_reason string. whale_full_exit never
-    # reaches this block (handled inline above) but keep the branch for
-    # defensive future-proofing.
+    # Classify reason from the human-readable exit_reason string.
+    # whale_full_exit never reaches this block (handled inline above) but
+    # the branch is kept for defensive future-proofing.
     _er_lower = (exit_reason or "").lower()
     if   "whale_full_exit" in _er_lower or "whale full exit" in _er_lower:
         _log_reason = "whale_full_exit"
@@ -3349,29 +3362,22 @@ async def check_and_maybe_exit(
     elif "take profit" in _er_lower or "take-profit" in _er_lower or "tp" in _er_lower:
         _log_reason = "take_profit"
     else:                           _log_reason = exit_reason or "unknown"
-    _log_trade(pos, _log_reason, current_sol, token_mint)
-
-    # Remove from open_positions *before* logging so monitor doesn't re-enter
-    del open_positions[token_mint]
-    _save_positions()
-    _mark_token_traded(token_mint)
 
     # Blacklist on trailing stop ONLY — take profit and time stop allow re-entry
-    if exit_reason.startswith("TRAILING STOP"):
-        _token_blacklist[token_mint] = time.time() + BLACKLIST_MINUTES * 60
-        _save_blacklist()
+    _blacklist_this_exit = exit_reason.startswith("TRAILING STOP")
+
+    _real_pnl_sol, _real_pnl_pct = _finalize_successful_exit(
+        pos, token_mint, current_sol, _log_reason,
+        blacklist=_blacklist_this_exit,
+    )
+    if _blacklist_this_exit:
         logger.info(
             f"[{token_mint[:8]}] Blacklisted for {BLACKLIST_MINUTES}min "
             f"(trailing stop loss — will not re-enter until cooldown expires)"
         )
 
-    # Update daily stats with REAL pnl (accounts for TP1 / partial-mirror proceeds)
-    if _real_pnl_pct >= 0:
-        _stats["wins"] += 1
-    else:
-        _stats["losses"] += 1
-    _stats["net_pnl_sol"] = round(_stats["net_pnl_sol"] + _real_pnl_sol, 6)
-    _record_trade(_real_pnl_sol)
+    pnl_sign = "+" if _real_pnl_pct >= 0 else ""
+    emoji    = "💰" if _real_pnl_pct >= 0 else "🛑"
 
     mc_entry_str = _fmt_usd(mc_entry_stored) if mc_entry_stored else "—"
     mc_exit_str  = _fmt_usd(mc_exit)         if mc_exit         else "—"
