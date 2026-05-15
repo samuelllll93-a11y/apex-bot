@@ -49,7 +49,7 @@ SOL_MINT         = "So11111111111111111111111111111111111111112"
 WSOL_MINT        = "So11111111111111111111111111111111111111112"
 
 DRY_RUN          = os.getenv("DRY_RUN", "True").lower() == "true"
-BUY_AMOUNT_SOL   = float(os.getenv("BUY_AMOUNT_SOL", "0.1"))
+BUY_AMOUNT_SOL   = float(os.getenv("BUY_AMOUNT_SOL", "0.025"))   # source-agnostic flat size
 MAX_SLIPPAGE_BPS      = int(os.getenv("MAX_SLIPPAGE_BPS", "2000"))
 SELL_SLIPPAGE_BPS     = 3000   # 30% slippage for sells (was 20% — bumped
                                # after a wave of Custom-17 "ExceededSlippage"
@@ -96,7 +96,7 @@ LOW_BALANCE_SOL   = float(os.getenv("LOW_BALANCE_SOL", "0.05"))  # skip trade + 
 
 # Whale wallets to track
 WHALE_WALLETS: dict[str, str] = {
-    "peace":    "7b88jCzsirGfLmFMyr7BXbCaDGTtuq8oDTWusqWvLv38",
+    # "peace":    "7b88jCzsirGfLmFMyr7BXbCaDGTtuq8oDTWusqWvLv38",  # disabled 2026-05-15 — 17% WR / -0.08 SOL over 12 trades (8-12 May). Re-enable after 2 weeks if crispy/mannos/bullishness perform.
     "crispy":   "EdbNfzVJjVZFsz1awBezeJpBaySLsckoZyPyaucy3g2R",
     "mannos":   "CAmNcBJ82xr1tzXrwZ6tZKwEFs26TG8kT6dJeR1bxjW9",
     # "mr.putin": "8mzCDvq5JWJh6Cus7XYnnwL2JGCVUXA3bDqaXmzCG5hn",  # disabled 2026-04-07
@@ -283,7 +283,7 @@ GRADUATED_WATCHLIST_PATH = "data/graduated_watchlist.json"
 DIP_SNIPER_DROP_PCT      = 50.0   # trigger re-entry if price drops X% from ATH
 DIP_SNIPER_MIN_SCORE     = 65     # minimum Claude score to enter a dip
 WHALE_MIN_SCORE          = 50     # minimum Claude score to enter a whale copy
-CTO_SIGNAL_BUY_SOL       = 0.02   # Fixed position size for DexAlert CTO signals
+CTO_SIGNAL_BUY_SOL       = 0.025  # Aligned to source-agnostic flat size 2026-05-15
 DIP_SNIPER_WATCH_HOURS   = 8      # expire tokens from watchlist after X hours
 DIP_SNIPER_CHECK_SEC     = 60     # how often the dip sniper loop runs
 
@@ -2748,64 +2748,96 @@ async def execute_buy_routed(
     return await execute_swap(session, quote, wallet_pubkey)
 
 
+SELL_LATENCY_THRESHOLD_SEC = 15.0   # log sells slower than this for diagnostics
+
+
 async def execute_sell_routed(
     session: aiohttp.ClientSession,
     token_mint: str,
     amount_tokens: int,
     wallet_pubkey: str,
     mc_usd: float,
+    *,
+    exit_reason: str = "",
 ) -> tuple[str | None, str]:
     """
     Unified sell router. Route order depends on PREFER_JUPITER_SELLS.
     Returns (txid, message) or (None, reason).
+
+    Wall-clock duration of the full quote+swap+confirm cascade is
+    captured for diagnostics; if it exceeds SELL_LATENCY_THRESHOLD_SEC
+    a [SELL_LATENCY] warning is logged. The exit_reason kwarg flows
+    through purely for that log line — strategy-vs-latency correlation
+    once enough samples are collected. Existing callers that don't
+    pass exit_reason still work (default "").
     """
     grad_label = "post-grad" if _is_graduated(mc_usd) else "pre-grad"
+    _sl_start  = time.time()
+    _sl_route  = "none"    # mutated below as we proceed; read in finally
+    _sl_sig: str | None = None
 
-    if PREFER_JUPITER_SELLS:
-        # --- Jupiter first, PumpPortal fallback ---
-        logger.info(f"[ROUTER] Jupiter sell ({grad_label}, primary) — MC ${mc_usd:,.0f}")
-        quote = await get_sell_quote(session, token_mint, amount_tokens)
-        if quote:
+    try:
+        if PREFER_JUPITER_SELLS:
+            # --- Jupiter first, PumpPortal fallback ---
+            logger.info(f"[ROUTER] Jupiter sell ({grad_label}, primary) — MC ${mc_usd:,.0f}")
+            quote = await get_sell_quote(session, token_mint, amount_tokens)
+            if quote:
+                jup_sig, jup_msg = await execute_swap(session, quote, wallet_pubkey)
+                if jup_sig:
+                    logger.info(f"[ROUTER] Sell succeeded via Jupiter")
+                    _sl_route, _sl_sig = "jupiter", jup_sig
+                    return jup_sig, f"{jup_msg} (via Jupiter)"
+                jup_fail = jup_msg
+            else:
+                jup_fail = "Jupiter sell quote failed"
+
+            logger.info(f"[ROUTER] PumpPortal sell ({grad_label}, fallback) — Jupiter failed: {jup_fail}")
+            send_telegram(
+                f"⚠️ <b>Jupiter sell failed</b> — attempting PumpPortal fallback\n"
+                f"Reason: {jup_fail}"
+            )
+            sig, msg = await execute_pumpfun_sell(session, token_mint, amount_tokens, wallet_pubkey)
+            if sig:
+                logger.info(f"[ROUTER] Sell succeeded via PumpPortal fallback")
+                _sl_route, _sl_sig = "jupiter→pumpportal", sig
+                return sig, f"{msg} (via PumpPortal fallback)"
+            _sl_route = "both_failed"
+            return None, f"Jupiter: {jup_fail} | PumpPortal: {msg}"
+
+        else:
+            # --- PumpPortal first, Jupiter fallback ---
+            logger.info(f"[ROUTER] PumpPortal sell ({grad_label}, primary) — MC ${mc_usd:,.0f}")
+            sig, msg = await execute_pumpfun_sell(session, token_mint, amount_tokens, wallet_pubkey)
+            if sig:
+                logger.info(f"[ROUTER] Sell succeeded via PumpPortal")
+                _sl_route, _sl_sig = "pumpportal", sig
+                return sig, f"{msg} (via PumpPortal)"
+
+            logger.info(f"[ROUTER] Jupiter sell ({grad_label}, fallback) — PumpPortal failed: {msg}")
+            send_telegram(
+                f"⚠️ <b>PumpPortal sell failed</b> — attempting Jupiter fallback\n"
+                f"Reason: {msg}"
+            )
+            quote = await get_sell_quote(session, token_mint, amount_tokens)
+            if not quote:
+                _sl_route = "both_failed"
+                return None, f"PumpPortal: {msg} | Jupiter quote also failed"
             jup_sig, jup_msg = await execute_swap(session, quote, wallet_pubkey)
             if jup_sig:
-                logger.info(f"[ROUTER] Sell succeeded via Jupiter")
-                return jup_sig, f"{jup_msg} (via Jupiter)"
-            jup_fail = jup_msg
-        else:
-            jup_fail = "Jupiter sell quote failed"
-
-        logger.info(f"[ROUTER] PumpPortal sell ({grad_label}, fallback) — Jupiter failed: {jup_fail}")
-        send_telegram(
-            f"⚠️ <b>Jupiter sell failed</b> — attempting PumpPortal fallback\n"
-            f"Reason: {jup_fail}"
-        )
-        sig, msg = await execute_pumpfun_sell(session, token_mint, amount_tokens, wallet_pubkey)
-        if sig:
-            logger.info(f"[ROUTER] Sell succeeded via PumpPortal fallback")
-            return sig, f"{msg} (via PumpPortal fallback)"
-        return None, f"Jupiter: {jup_fail} | PumpPortal: {msg}"
-
-    else:
-        # --- PumpPortal first, Jupiter fallback ---
-        logger.info(f"[ROUTER] PumpPortal sell ({grad_label}, primary) — MC ${mc_usd:,.0f}")
-        sig, msg = await execute_pumpfun_sell(session, token_mint, amount_tokens, wallet_pubkey)
-        if sig:
-            logger.info(f"[ROUTER] Sell succeeded via PumpPortal")
-            return sig, f"{msg} (via PumpPortal)"
-
-        logger.info(f"[ROUTER] Jupiter sell ({grad_label}, fallback) — PumpPortal failed: {msg}")
-        send_telegram(
-            f"⚠️ <b>PumpPortal sell failed</b> — attempting Jupiter fallback\n"
-            f"Reason: {msg}"
-        )
-        quote = await get_sell_quote(session, token_mint, amount_tokens)
-        if not quote:
-            return None, f"PumpPortal: {msg} | Jupiter quote also failed"
-        jup_sig, jup_msg = await execute_swap(session, quote, wallet_pubkey)
-        if jup_sig:
-            logger.info(f"[ROUTER] Sell succeeded via Jupiter fallback")
-            return jup_sig, f"{jup_msg} (via Jupiter fallback)"
-        return None, f"PumpPortal: {msg} | Jupiter: {jup_msg}"
+                logger.info(f"[ROUTER] Sell succeeded via Jupiter fallback")
+                _sl_route, _sl_sig = "pumpportal→jupiter", jup_sig
+                return jup_sig, f"{jup_msg} (via Jupiter fallback)"
+            _sl_route = "both_failed"
+            return None, f"PumpPortal: {msg} | Jupiter: {jup_msg}"
+    finally:
+        _sl_dur = time.time() - _sl_start
+        if _sl_dur > SELL_LATENCY_THRESHOLD_SEC:
+            logger.warning(
+                f"[SELL_LATENCY] {token_mint[:8]} | {_sl_dur:.1f}s | "
+                f"route={_sl_route} | "
+                f"outcome={'success' if _sl_sig else 'failed'} | "
+                f"exit_reason={exit_reason or 'unknown'}"
+            )
 
 
 # --- Telegram ---------------------------------------------------------
@@ -3129,7 +3161,8 @@ async def check_and_maybe_exit(
                 )
             else:
                 _wfe_sig, _wfe_msg = await execute_sell_routed(
-                    session, token_mint, _live_tokens, wallet_pubkey, mc_now
+                    session, token_mint, _live_tokens, wallet_pubkey, mc_now,
+                    exit_reason="whale_full_exit",
                 )
                 if not _wfe_sig:
                     # Cap consecutive whale_full_exit retries the same way the
@@ -3223,7 +3256,8 @@ async def check_and_maybe_exit(
             )
         else:
             _hf_sig, _hf_msg = await execute_sell_routed(
-                session, token_mint, _hf_live_tokens, wallet_pubkey, mc_now
+                session, token_mint, _hf_live_tokens, wallet_pubkey, mc_now,
+                exit_reason="hard_floor",
             )
             if not _hf_sig:
                 _hf_fc = _sell_failure_counts.get(token_mint, 0) + 1
@@ -3325,7 +3359,8 @@ async def check_and_maybe_exit(
             )
         else:
             _tp1_sig, _tp1_msg = await execute_sell_routed(
-                session, token_mint, _sell_tokens, wallet_pubkey, mc_now
+                session, token_mint, _sell_tokens, wallet_pubkey, mc_now,
+                exit_reason="tp1_partial",
             )
             if _tp1_sig:
                 # Estimate SOL received from MC ratio (PumpFun sells don't return outAmount)
@@ -3435,7 +3470,8 @@ async def check_and_maybe_exit(
             )
         else:
             _mh_sig, _mh_msg = await execute_sell_routed(
-                session, token_mint, _mh_live_tokens, wallet_pubkey, mc_now
+                session, token_mint, _mh_live_tokens, wallet_pubkey, mc_now,
+                exit_reason="max_hold_exit",
             )
             if not _mh_sig:
                 _mh_fc = _sell_failure_counts.get(token_mint, 0) + 1
@@ -3535,7 +3571,8 @@ async def check_and_maybe_exit(
         )
     else:
         sell_sig, sell_msg = await execute_sell_routed(
-            session, token_mint, _exit_live_tokens, wallet_pubkey, mc_now
+            session, token_mint, _exit_live_tokens, wallet_pubkey, mc_now,
+            exit_reason=exit_reason,
         )
         if not sell_sig:
             # Increment consecutive-failure counter for this position.
@@ -5038,15 +5075,14 @@ async def poll_whale(
             )
         # ----------------------------------------------------------------
 
-        # --- Position sizing — mr.putin > prebond > normal ----------------
-        if name == "mr.putin":
-            buy_sol = round(sol_balance * MRPUTIN_CONFIG["position_size_pct"], 4)
-            logger.info(
-                f"[MR.PUTIN] Position: {buy_sol} SOL (1% balance) | "
-                f"min hold {MRPUTIN_CONFIG['min_hold_mins']}m | "
-                f"time stop {MRPUTIN_CONFIG['time_stop_mins']}m"
-            )
-        elif prebond_buy_sol is not None:
+        # --- Position sizing — prebond > normal ---------------------------
+        # mr.putin per-whale sizing branch removed 2026-05-15: source-
+        # agnostic flat BUY_AMOUNT_SOL per the exit-logic rebuild. mr.putin
+        # is disabled in WHALE_WALLETS anyway, but the branch is removed
+        # so a future re-enable doesn't quietly resurrect the override.
+        # MRPUTIN_CONFIG and the mcap gate above stay in place per scope
+        # guard ("leave MRPUTIN_CONFIG and pre-bond scoring alone").
+        if prebond_buy_sol is not None:
             buy_sol = prebond_buy_sol
             logger.info(f"[{name}] Prebond position size: {buy_sol} SOL (2% of balance)")
         else:
