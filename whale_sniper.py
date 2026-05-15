@@ -63,6 +63,21 @@ SELL_SLIPPAGE_BPS     = 3000   # 30% slippage for sells (was 20% — bumped
 SELL_ABANDON_AFTER_FAILURES = 10
 _sell_failure_counts: dict[str, int] = {}
 PREFER_JUPITER_SELLS  = True   # Jupiter first for sells; PumpPortal as fallback
+
+# Pre-TP1 hard floor — the missing stop loss. Before commit history shows
+# the trailing stop is gated behind min_target_hit (TP1 at +100% gain), so
+# any position that goes straight down arms nothing and rots until manual
+# /sell. 5-day production data (May 8-12) confirmed multi-hour holds at
+# -80% to -94% on momentum_scanner positions for exactly this reason. The
+# hard floor fires regardless of source (whale, momentum_scanner, cto,
+# dip_sniper, cluster) — it operates on pnl_pct only.
+#
+# -35% is the starting threshold. At 30% sell slippage (SELL_SLIPPAGE_BPS)
+# the realised loss after retries can be -50% to -60%; a tighter floor
+# (-25%) would trigger more often but might cut positions that would have
+# recovered. Tune via config.
+HARD_FLOOR_PCT     = -35.0
+HARD_FLOOR_ENABLED = True
 PRIORITY_FEE_LAMPORTS = int(os.getenv("PRIORITY_FEE_LAMPORTS", "100000"))
 
 TX_CONFIRM_TIMEOUT_SEC = 30   # give up on confirmation after this many seconds
@@ -1822,6 +1837,28 @@ def _hybrid_trail_pct(pos: dict) -> float:
     return HYBRID_PREGRAD_TRAIL_PCT if pos.get("was_pregrad", False) else HYBRID_GRADUATED_TRAIL_PCT
 
 
+def _hard_floor_check(pnl_pct: float, min_target_hit: bool) -> str | None:
+    """Pre-TP1 hard floor exit decision. Returns an exit reason string when
+    the position has dropped past HARD_FLOOR_PCT from entry and TP1 has
+    not fired yet; otherwise None.
+
+    Post-TP1 (min_target_hit=True) the trailing stop owns the downside —
+    by then the entry basis has been recalibrated and the remainder is
+    effectively a free ride, so hard floor would never fire correctly
+    anyway.
+
+    Source-agnostic: applies to whale_copy, momentum_scanner, cto_signal,
+    dip_sniper, and cluster_buy positions identically.
+    """
+    if not HARD_FLOOR_ENABLED:
+        return None
+    if min_target_hit:
+        return None
+    if pnl_pct <= HARD_FLOOR_PCT:
+        return f"HARD FLOOR ({pnl_pct:+.1f}% <= {HARD_FLOOR_PCT:.0f}%)"
+    return None
+
+
 def _hybrid_exit_check(pos: dict, drop_from_peak: float) -> str | None:
     """Primary exit: a simple percent-from-peak trailing stop with NO time
     stop, NO hard floor, and NO min-target gating. Trail width depends on
@@ -3129,9 +3166,90 @@ async def check_and_maybe_exit(
         _save_positions()
     # --- END WHALE FULL-EXIT EMERGENCY --------------------------------
 
+    # --- Pre-TP1 hard floor --------------------------------------------
+    # Force-exit when pnl drops past HARD_FLOOR_PCT before TP1 arms.
+    # This is the only stop loss for positions that never reach +100%
+    # (e.g. momentum_scanner picks that go straight down) and the
+    # earliest stop loss for whale_copy positions other than a full
+    # whale dump.
+    min_target_hit = pos.get("min_target_hit", False)
+    _hf_exit_reason = _hard_floor_check(pnl_pct, min_target_hit)
+    if _hf_exit_reason is not None:
+        _hf_label = pos.get("token_label") or token_mint[:8]
+        _hf_symbol = pos.get("token_symbol") or _hf_label
+        _hf_live_tokens = await get_spl_token_balance(session, token_mint, wallet_pubkey)
+        if _hf_live_tokens <= 0:
+            logger.warning(
+                f"[{token_mint[:8]}] on-chain balance is 0 — aborting hard floor "
+                f"sell (trigger: {_hf_exit_reason})"
+            )
+            send_telegram(
+                f"⚠️ <b>HARD FLOOR ABORTED</b> — {_hf_label}\n"
+                f"CA: <code>{token_mint}</code>\n"
+                f"Trigger: {_hf_exit_reason}\n"
+                f"Wallet shows no token balance on-chain"
+            )
+            return
+        open_positions[token_mint]["amount_tokens"] = _hf_live_tokens
+        _save_positions()
+
+        if DRY_RUN:
+            _hf_sig = "DRY_RUN_HARD_FLOOR_SIG"
+            logger.info(
+                f"[DRY RUN] hard_floor would sell {_hf_live_tokens:,} → "
+                f"~{current_sol:.4f} SOL ({_hf_exit_reason})"
+            )
+        else:
+            _hf_sig, _hf_msg = await execute_sell_routed(
+                session, token_mint, _hf_live_tokens, wallet_pubkey, mc_now
+            )
+            if not _hf_sig:
+                _hf_fc = _sell_failure_counts.get(token_mint, 0) + 1
+                _sell_failure_counts[token_mint] = _hf_fc
+                logger.error(
+                    f"[{token_mint[:8]}] hard floor sell failed ({_hf_msg}) — "
+                    f"attempt {_hf_fc}/{SELL_ABANDON_AFTER_FAILURES}. "
+                    f"Trigger was: {_hf_exit_reason}"
+                )
+                _apex_log_error(
+                    token_mint, pos.get("whale_name") or pos.get("whale"),
+                    "hard_floor_sell_failed",
+                    {"msg": _hf_msg, "trigger": _hf_exit_reason, "attempt": _hf_fc},
+                )
+                if _hf_fc >= SELL_ABANDON_AFTER_FAILURES:
+                    _abandon_unsellable_position(
+                        pos, token_mint, _hf_msg,
+                        exit_reason=_hf_exit_reason,
+                    )
+                    return
+                return  # retry next tick — position stays open
+
+        # Successful sell — finalize via shared helper. Blacklist on
+        # hard-floor exits for the same reason trailing-stop blacklists:
+        # the token already dumped on us once, avoid re-entry during
+        # cooldown.
+        _hf_real_sol, _hf_real_pct = _finalize_successful_exit(
+            pos, token_mint, current_sol, "hard_floor",
+            blacklist=True,
+        )
+        _hf_sign = "+" if _hf_real_pct >= 0 else ""
+        logger.info(
+            f"[{token_mint[:8]}] hard_floor sig={_hf_sig} | real PnL: "
+            f"{_hf_sign}{_hf_real_pct:.1f}% ({_hf_sign}{_hf_real_sol:.4f} SOL)"
+        )
+        send_telegram(
+            f"🛡️ <b>HARD FLOOR</b> — {_hf_symbol} hard floor at "
+            f"{_hf_sign}{_hf_real_pct:.1f}% — exiting\n"
+            f"CA: <code>{token_mint}</code>\n"
+            f"Trigger: {_hf_exit_reason}\n"
+            f"Realised PnL: {_hf_sign}{_hf_real_pct:.1f}% "
+            f"({_hf_sign}{_hf_real_sol:.4f} SOL)"
+        )
+        return
+    # --- END HARD FLOOR ------------------------------------------------
+
     # --- MANNOS tiered exit (secondary safety net) ---
     claude_score   = pos.get("claude_score", 70)
-    min_target_hit = pos.get("min_target_hit", False)
     tier           = get_exit_tier(claude_score)
 
     # --- TP1 partial sell at 2x -------------------------------------------
