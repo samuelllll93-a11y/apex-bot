@@ -88,6 +88,15 @@ TRAILING_STOP_PCT  = float(os.getenv("TRAILING_STOP_PCT", "0.10")) * 100  # .env
 TIME_STOP_MIN      = int(os.getenv("TIME_STOP_MIN", "30"))  # minutes
 POSITION_CHECK_SEC = 10     # how often the sell monitor loop runs
 
+# Per-position consecutive-failed-sell tracking. After this many back-to-back
+# failed full-exit sells (HSF / HTP / generic MANNOS exit) the position is
+# abandoned (logged + blacklisted) to stop the monitor loop retrying an
+# unsellable bag forever every tick. TP1 partial-sell failures do NOT
+# increment this counter — partials fail-open and the full position
+# continues under monitoring, where any later full-exit failure DOES count.
+SELL_ABANDON_AFTER_FAILURES = 10
+_sell_failure_counts: dict[str, int] = {}
+
 # --- Emergency exit parameters ----------------------------------------
 EMERGENCY_DUMP_PCT        = 40.0  # emergency exit if down >40% right after buy
 EMERGENCY_CHECK_DELAY_SEC = 5    # seconds after buy before emergency check runs
@@ -214,6 +223,60 @@ _SUMMARY_WINDOW_SEC = 43_200  # 12 hours
 def _record_trade(pnl_sol: float) -> None:
     """Append a closed trade to the rolling trade log."""
     _trade_log.append({"ts": time.time(), "pnl_sol": round(pnl_sol, 6)})
+
+
+def _abandon_unsellable_position(
+    pos: dict,
+    token_mint: str,
+    sell_msg: str,
+    exit_reason: str,
+) -> None:
+    """Finalize an unsellable position after SELL_ABANDON_AFTER_FAILURES
+    consecutive failed full-exit sells. Removes the position, blacklists
+    the token for the standard cooldown, updates daily stats with a
+    -100% realised loss (received 0 SOL — entry cost is the loss),
+    sends the abandonment Telegram alert, and clears the per-position
+    failure counter.
+
+    PnL accounting matches main's existing exit paths (e.g. the generic
+    exit at the bottom of check_and_maybe_exit uses current_sol -
+    entry_sol without netting out tp1_received_sol). If main later
+    adopts TP1-aware PnL, this helper should follow.
+    """
+    label     = pos.get("token_label") or token_mint[:8]
+    entry_sol = float(pos.get("entry_sol") or 0.0)
+    pnl_sol   = -entry_sol
+    pnl_pct   = -100.0 if entry_sol > 0 else 0.0
+
+    del open_positions[token_mint]
+    _save_positions()
+    _token_blacklist[token_mint] = time.time() + BLACKLIST_MINUTES * 60
+    _save_blacklist()
+    _sell_failure_counts.pop(token_mint, None)
+
+    if pnl_pct >= 0:
+        _stats["wins"] += 1
+    else:
+        _stats["losses"] += 1
+    _stats["net_pnl_sol"] = round(_stats["net_pnl_sol"] + pnl_sol, 6)
+    _record_trade(pnl_sol)
+
+    send_telegram(
+        f"🗑 <b>POSITION ABANDONED</b> — {label}\n"
+        f"CA: <code>{token_mint}</code>\n"
+        f"Reason: unsellable after {SELL_ABANDON_AFTER_FAILURES} "
+        f"consecutive sell failures\n"
+        f"Last error: {sell_msg[:200]}\n"
+        f"Trigger: {exit_reason}\n"
+        f"Final PnL: {pnl_pct:.1f}% ({pnl_sol:.4f} SOL)\n"
+        f"Token blacklisted for {BLACKLIST_MINUTES}min."
+    )
+    logger.warning(
+        f"[{token_mint[:8]}] ABANDONED after "
+        f"{SELL_ABANDON_AFTER_FAILURES} consecutive sell failures "
+        f"| trigger was: {exit_reason} | PnL: {pnl_pct:.1f}%"
+    )
+
 
 # --- Helius rate tracker ----------------------------------------------
 
@@ -2357,18 +2420,28 @@ async def check_and_maybe_exit(
                 session, token_mint, _hsf_live_tokens, wallet_pubkey, mc_now
             )
             if not _hsf_sig:
+                _fc = _sell_failure_counts.get(token_mint, 0) + 1
+                _sell_failure_counts[token_mint] = _fc
                 logger.error(
                     f"[HARD SELL FLOOR] {token_mint[:8]} | Sell failed ({_hsf_msg}) — "
-                    f"keeping position open, will retry next cycle"
+                    f"attempt {_fc}/{SELL_ABANDON_AFTER_FAILURES}"
                 )
+                if _fc >= SELL_ABANDON_AFTER_FAILURES:
+                    _abandon_unsellable_position(
+                        pos, token_mint, _hsf_msg, "HARD SELL FLOOR (-35%)"
+                    )
+                    return
                 send_telegram(
                     f"⚠️ <b>HARD SELL FLOOR FAILED</b> — {_hsf_label}\n"
                     f"Reason: {_hsf_msg}\n"
-                    f"Position stays open — will retry"
+                    f"Attempt {_fc}/{SELL_ABANDON_AFTER_FAILURES} — "
+                    f"position stays open, will retry"
                 )
                 return
 
-        # Success — close position
+        # Success — close position. Clear any accumulated failure counter
+        # so a future re-entry of the same mint starts from a clean slate.
+        _sell_failure_counts.pop(token_mint, None)
         _hsf_pnl_sol = current_sol - entry_sol
         del open_positions[token_mint]
         _save_positions()
@@ -2428,18 +2501,27 @@ async def check_and_maybe_exit(
                 session, token_mint, _htp_live_tokens, wallet_pubkey, mc_now
             )
             if not _htp_sig:
+                _fc = _sell_failure_counts.get(token_mint, 0) + 1
+                _sell_failure_counts[token_mint] = _fc
                 logger.error(
                     f"[HARD TP] {token_mint[:8]} | Sell failed ({_htp_msg}) — "
-                    f"keeping position open, will retry next cycle"
+                    f"attempt {_fc}/{SELL_ABANDON_AFTER_FAILURES}"
                 )
+                if _fc >= SELL_ABANDON_AFTER_FAILURES:
+                    _abandon_unsellable_position(
+                        pos, token_mint, _htp_msg, _htp_reason
+                    )
+                    return
                 send_telegram(
                     f"⚠️ <b>HARD TP SELL FAILED</b> — {_htp_label}\n"
                     f"Reason: {_htp_msg}\n"
-                    f"Position stays open — will retry"
+                    f"Attempt {_fc}/{SELL_ABANDON_AFTER_FAILURES} — "
+                    f"position stays open, will retry"
                 )
                 return
 
-        # Success — close position
+        # Success — close position. Clear any accumulated failure counter.
+        _sell_failure_counts.pop(token_mint, None)
         _htp_pnl_sol = current_sol - entry_sol
         del open_positions[token_mint]
         _save_positions()
@@ -2646,10 +2728,25 @@ async def check_and_maybe_exit(
             session, token_mint, _exit_live_tokens, wallet_pubkey, mc_now
         )
         if not sell_sig:
+            _fc = _sell_failure_counts.get(token_mint, 0) + 1
+            _sell_failure_counts[token_mint] = _fc
             logger.error(
                 f"[{token_mint[:8]}] Sell swap failed ({sell_msg}) — "
-                f"keeping position open, will retry next cycle. "
+                f"attempt {_fc}/{SELL_ABANDON_AFTER_FAILURES}. "
                 f"Trigger was: {exit_reason}"
+            )
+            if _fc >= SELL_ABANDON_AFTER_FAILURES:
+                _abandon_unsellable_position(
+                    pos, token_mint, sell_msg, exit_reason
+                )
+                return
+            _exit_label = pos.get("token_label") or token_mint[:8]
+            send_telegram(
+                f"⚠️ <b>SELL FAILED</b> — {_exit_label}\n"
+                f"Trigger: {exit_reason}\n"
+                f"Reason: {sell_msg}\n"
+                f"Attempt {_fc}/{SELL_ABANDON_AFTER_FAILURES} — "
+                f"position stays open, will retry"
             )
             return  # don't clear position if live sell tx failed
 
@@ -2661,6 +2758,9 @@ async def check_and_maybe_exit(
     mc_exit   = float((_sell_dex or {}).get("marketCap") or (_sell_dex or {}).get("fdv") or 0)
     mc_entry_stored  = pos.get("mc_entry", 0)
     token_label_sell = pos.get("token_label") or token_mint[:8]
+
+    # Clear any accumulated failure counter — successful sell resets the slate.
+    _sell_failure_counts.pop(token_mint, None)
 
     # Remove from open_positions *before* logging so monitor doesn't re-enter
     del open_positions[token_mint]
