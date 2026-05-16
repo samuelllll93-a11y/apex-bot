@@ -31,6 +31,7 @@ from logging.handlers import TimedRotatingFileHandler
 from zoneinfo import ZoneInfo
 
 import aiohttp
+import anthropic
 import requests
 from dotenv import load_dotenv
 
@@ -80,6 +81,21 @@ LORE_SCHEDULER_STATE_FILE  = os.path.join(_HERE, "state", "lore_scheduler_state.
 # misses get re-fired automatically.
 LORE_TOP3_PERTH_HOUR = 9
 PERTH_TZ = ZoneInfo("Australia/Perth")
+
+# 3-day Claude analysis fires Mon/Thu/Sun (weekday() values: Mon=0,
+# Thu=3, Sun=6) at the same 09:00 Perth hour. Same scheduler pattern
+# as the daily top-3 — restart-safe via last_lore_analysis_date in
+# lore_scheduler_state.json.
+LORE_ANALYSIS_WEEKDAYS    = {0, 3, 6}    # Mon, Thu, Sun
+LORE_ANALYSIS_PERTH_HOUR  = 9
+LORE_ANALYSIS_WINDOW_DAYS = 3
+
+# Claude API config — matches whale_sniper's pattern. claude-haiku-4-5
+# is the current fast/cheap tier (used by whale_sniper for Claude
+# scoring at line 1188). At ~30 calls/month × ~13k tokens each the
+# monthly spend is well under $1.
+LORE_CLAUDE_MODEL      = "claude-haiku-4-5"
+LORE_CLAUDE_MAX_TOKENS = 1500
 
 # Rolling window for closed-trade metrics — entries older than this
 # are pruned on each tick's write. 30 days matches the user spec for
@@ -175,16 +191,16 @@ def _load_chat_ids() -> list[str]:
 _telegram_chat_ids: list[str] = _load_chat_ids()
 
 
-def send_telegram(message: str) -> bool:
-    """Send a Telegram message to all authorised chat IDs.
-    Returns True if at least one delivery succeeded.
+def _send_telegram_to(token: str, chat_ids: list[str], message: str) -> bool:
+    """Inner send helper — POST to one bot's sendMessage endpoint for
+    each chat_id in chat_ids. Returns True if any delivery succeeded.
+    Logs errors per chat without raising.
     """
-    token = os.getenv("TELEGRAM_BOT_TOKEN")
-    if not token or not _telegram_chat_ids:
-        logger.error("send_telegram: TELEGRAM_BOT_TOKEN or chat IDs not set — alert dropped")
+    if not token or not chat_ids:
+        logger.error("send_telegram: token or chat IDs not set — alert dropped")
         return False
     any_ok = False
-    for chat_id in _telegram_chat_ids:
+    for chat_id in chat_ids:
         try:
             resp = requests.post(
                 f"https://api.telegram.org/bot{token}/sendMessage",
@@ -198,6 +214,32 @@ def send_telegram(message: str) -> bool:
         except Exception as e:
             logger.error(f"Telegram send failed for {chat_id}: {e}")
     return any_ok
+
+
+def send_telegram(message: str) -> bool:
+    """Broadcast a message via the PRIMARY bot (TELEGRAM_BOT_TOKEN)
+    to all authorised chat IDs. Used by scheduled reports (daily
+    top-3, 3-day Claude analysis) so they land on the same channels
+    as whale_sniper's existing alerts.
+    """
+    return _send_telegram_to(
+        os.getenv("TELEGRAM_BOT_TOKEN", ""),
+        _telegram_chat_ids,
+        message,
+    )
+
+
+def send_telegram_lore_reply(chat_id: str, message: str) -> bool:
+    """Reply via the SECONDARY bot (TELEGRAM_BOT_TOKEN_LORE) to a
+    specific chat ID — used by /lore command replies so the response
+    comes back through the same bot the user typed into. Falls
+    silently to False if the lore bot token is not configured.
+    """
+    token = os.getenv("TELEGRAM_BOT_TOKEN_LORE", "").strip()
+    if not token:
+        logger.error("send_telegram_lore_reply: TELEGRAM_BOT_TOKEN_LORE not set — reply dropped")
+        return False
+    return _send_telegram_to(token, [str(chat_id)], message)
 
 
 # Helius call tracker — independent counter for the lore tracker
@@ -957,6 +999,461 @@ async def _top3_scheduler_loop(wallets: dict[str, dict]) -> None:
         await asyncio.sleep(60)
 
 
+# --- 3-day Claude analysis --------------------------------------------
+# Mon/Thu/Sun 9am Perth: aggregate the last 3 days of group activity,
+# send to Claude (haiku 4.5) with a strict-JSON prompt requesting
+# PROMOTE/WATCH/DEMOTE recommendations, parse, render to Telegram.
+
+def _aggregate_3day_group_data(
+    wallets: dict[str, dict],
+    metrics: dict,
+    closed_trades: list,
+) -> dict:
+    """Build the per-group 3-day rollup that gets sent to Claude.
+    Only groups with at least one trade in the window appear in the
+    output — Claude shouldn't waste tokens analysing inactive groups.
+    """
+    now    = time.time()
+    cutoff = now - LORE_ANALYSIS_WINDOW_DAYS * 86_400
+    addr_to_group: dict[str, str] = {}
+    for addr, meta in wallets.items():
+        addr_to_group[addr] = ((meta or {}).get("group") or "?").strip() or "?"
+
+    # Bucket recent trades by group + accumulate stats
+    g_stats: dict[str, dict] = {}
+    for t in closed_trades:
+        exit_t = float(t.get("exit_time") or 0)
+        if exit_t < cutoff:
+            continue
+        wallet = t.get("wallet") or ""
+        group  = addr_to_group.get(wallet, "?")
+        g = g_stats.setdefault(group, {
+            "trades_3d":          0,
+            "wins_3d":            0,
+            "total_pnl_sol_3d":   0.0,
+            "hold_min_sum":       0.0,
+            "last_activity_ts":   0.0,
+        })
+        g["trades_3d"]        += 1
+        pnl = float(t.get("pnl_sol") or 0)
+        if pnl > 0:
+            g["wins_3d"] += 1
+        g["total_pnl_sol_3d"] += pnl
+        g["hold_min_sum"]     += float(t.get("hold_minutes") or 0)
+        if exit_t > g["last_activity_ts"]:
+            g["last_activity_ts"] = exit_t
+
+    # Cross-reference with the wallet roster for member counts +
+    # active/dormant breakdowns + representative emoji
+    by_group  = _wallets_by_group(wallets)
+    dormant_cutoff = now - LORE_DORMANT_THRESHOLD_DAYS * 86_400
+
+    groups_out = []
+    for group, stats in g_stats.items():
+        members      = by_group.get(group, [])
+        active_n     = 0
+        dormant_n    = 0
+        for addr in members:
+            ts = float((metrics.get(addr) or {}).get("last_activity_ts") or 0)
+            if ts > 0:
+                if ts >= dormant_cutoff:
+                    active_n += 1
+                else:
+                    dormant_n += 1
+        last_act_iso = ""
+        if stats["last_activity_ts"]:
+            last_act_iso = datetime.fromtimestamp(
+                stats["last_activity_ts"], PERTH_TZ
+            ).strftime("%Y-%m-%d %H:%M Perth")
+
+        win_rate = (stats["wins_3d"] / stats["trades_3d"]) if stats["trades_3d"] else 0.0
+        avg_hold = (stats["hold_min_sum"] / stats["trades_3d"]) if stats["trades_3d"] else 0.0
+        groups_out.append({
+            "group":                group,
+            "emoji":                _group_emoji(group, wallets),
+            "member_count":         len(members),
+            "active_members":       active_n,
+            "dormant_members":      dormant_n,
+            "trades_3d":            stats["trades_3d"],
+            "wins_3d":              stats["wins_3d"],
+            "win_rate_3d":          round(win_rate, 4),
+            "total_pnl_sol_3d":     round(stats["total_pnl_sol_3d"], 6),
+            "avg_hold_min":         round(avg_hold, 2),
+            "last_activity_perth":  last_act_iso,
+        })
+
+    # Most-traded group first so Claude sees high-signal items at top
+    groups_out.sort(key=lambda g: g["trades_3d"], reverse=True)
+
+    now_perth = datetime.now(PERTH_TZ).strftime("%Y-%m-%d %H:%M Perth")
+    return {
+        "window_days":  LORE_ANALYSIS_WINDOW_DAYS,
+        "as_of_perth":  now_perth,
+        "groups":       groups_out,
+    }
+
+
+_LORE_ANALYSIS_SCHEMA_DESCRIPTION = (
+    "Output schema (STRICT JSON — no markdown, no code fences, no preamble, "
+    "no trailing prose):\n"
+    "{\n"
+    '  "summary": string,  // 2-3 sentence overview of the past 3 days\n'
+    '  "promote": [\n'
+    '    {"group": string, "reasoning": string}  // 2-3 sentence reasoning\n'
+    "  ],\n"
+    '  "watch": [\n'
+    '    {"group": string, "reasoning": string}\n'
+    "  ],\n"
+    '  "demote": [\n'
+    '    {"group": string, "reasoning": string}\n'
+    "  ]\n"
+    "}\n"
+    "\n"
+    "Rules:\n"
+    "- promote: traders with strong consistency + positive total_pnl_sol_3d\n"
+    "- watch: declining win rate, mixed signals, or fading activity\n"
+    "- demote: negative PnL, very low win rate, or unrecoverable losses\n"
+    "- Only include groups that appear in the input data\n"
+    "- Empty arrays are valid when no candidates fit a category\n"
+    "- Each group name must match exactly the 'group' field in the input\n"
+)
+
+
+def _build_lore_analysis_prompt(data: dict) -> tuple[str, str]:
+    """Return (system_prompt, user_prompt) for the 3-day analysis.
+    Kept separate so tests can assert prompt structure without
+    invoking the API.
+    """
+    system_prompt = (
+        "You are a Solana trading performance analyst reviewing 3-day "
+        "metrics for trader groups (each group = one trader operating "
+        "one or more wallets). You output ONLY valid JSON matching the "
+        "user-supplied schema, with no preamble, no code fences, and no "
+        "trailing prose. Reasoning is concrete and references the "
+        "numbers in the input data."
+    )
+    user_prompt = (
+        f"Here is the 3-day group performance data ({data['window_days']} "
+        f"days back from {data['as_of_perth']}). "
+        f"{len(data['groups'])} groups had at least one closed trade in "
+        f"the window.\n\n"
+        f"DATA:\n{json.dumps(data, indent=2)}\n\n"
+        f"{_LORE_ANALYSIS_SCHEMA_DESCRIPTION}\n"
+        f"Respond with the JSON object only."
+    )
+    return system_prompt, user_prompt
+
+
+def _parse_lore_analysis_response(raw: str) -> dict | None:
+    """Robustly parse Claude's response. Strips code fences if the
+    model returns ```json ... ``` despite instructions. Returns the
+    parsed dict on success, None on parse failure (logged with the
+    raw response for diagnosis).
+    """
+    text = (raw or "").strip()
+    # Remove ```json prefix and ``` suffix if present
+    if text.startswith("```"):
+        # Find first newline after the opening fence
+        nl = text.find("\n")
+        if nl >= 0:
+            text = text[nl + 1:]
+        if text.endswith("```"):
+            text = text[: -3]
+        text = text.strip()
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as e:
+        logger.error(
+            f"[CLAUDE] Failed to parse lore analysis JSON: {e} | "
+            f"raw response: {raw[:500]!r}"
+        )
+        return None
+
+    # Basic shape validation — missing keys default to empty containers
+    if not isinstance(parsed, dict):
+        logger.error(f"[CLAUDE] Parsed JSON is not an object: {type(parsed).__name__}")
+        return None
+    return {
+        "summary": str(parsed.get("summary") or "").strip(),
+        "promote": parsed.get("promote") if isinstance(parsed.get("promote"), list) else [],
+        "watch":   parsed.get("watch")   if isinstance(parsed.get("watch"),   list) else [],
+        "demote":  parsed.get("demote")  if isinstance(parsed.get("demote"),  list) else [],
+    }
+
+
+def _format_lore_analysis_message(
+    parsed: dict,
+    wallets: dict[str, dict],
+) -> str:
+    """Render Claude's parsed response into the Telegram body per
+    the user-spec format. Sections with empty arrays are omitted.
+    Group emoji is looked up via _group_emoji so the message matches
+    the daily top-3 visual style.
+    """
+    now_perth     = datetime.now(PERTH_TZ).strftime("%Y-%m-%d %H:%M Perth")
+    lines = ["🧠 <b>LORE ANALYSIS — 3-day review</b>", ""]
+
+    summary = (parsed.get("summary") or "").strip()
+    if summary:
+        lines.append(summary)
+        lines.append("")
+
+    def _section(emoji_label: str, items: list) -> None:
+        if not items:
+            return
+        lines.append(emoji_label)
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            group     = (it.get("group") or "").strip()
+            reasoning = (it.get("reasoning") or "").strip()
+            if not group:
+                continue
+            emoji = _group_emoji(group, wallets)
+            emoji_part = f" {emoji}" if emoji else ""
+            lines.append(f"• {group}{emoji_part} — {reasoning}")
+        lines.append("")
+
+    _section("✅ <b>PROMOTE</b>", parsed.get("promote") or [])
+    _section("👀 <b>WATCH</b>",   parsed.get("watch")   or [])
+    _section("❌ <b>DEMOTE</b>",  parsed.get("demote")  or [])
+
+    lines.append(f"Updated: {now_perth}")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+async def _request_lore_analysis_from_claude(data: dict) -> dict | None:
+    """Call Claude with the 3-day data, return the parsed
+    recommendations dict, or None on any failure. Failures are
+    logged with enough context to diagnose later without leaking
+    the API key.
+    """
+    api_key = os.getenv("CLAUDE_API_KEY", "").strip()
+    if not api_key:
+        logger.error("CLAUDE_API_KEY not set in .env — lore analysis aborted")
+        return None
+    system_prompt, user_prompt = _build_lore_analysis_prompt(data)
+    try:
+        client = anthropic.AsyncAnthropic(api_key=api_key)
+        resp = await client.messages.create(
+            model=LORE_CLAUDE_MODEL,
+            max_tokens=LORE_CLAUDE_MAX_TOKENS,
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_prompt}],
+        )
+        # Anthropic SDK returns a list of content blocks; concatenate
+        # text-type blocks defensively.
+        raw_parts = []
+        for block in (resp.content or []):
+            block_text = getattr(block, "text", None)
+            if block_text:
+                raw_parts.append(block_text)
+        raw = "".join(raw_parts).strip()
+        if not raw:
+            logger.error("[CLAUDE] Empty response from lore analysis")
+            return None
+        logger.info(
+            f"[CLAUDE] Lore analysis received — "
+            f"{getattr(resp.usage, 'input_tokens', '?')} in / "
+            f"{getattr(resp.usage, 'output_tokens', '?')} out tokens"
+        )
+        return _parse_lore_analysis_response(raw)
+    except Exception as e:
+        logger.error(f"[CLAUDE] Lore analysis call failed: {type(e).__name__}: {e}")
+        return None
+
+
+async def _send_lore_analysis(
+    wallets: dict[str, dict],
+    *,
+    reply_chat_id: str | None = None,
+) -> bool:
+    """Orchestrate: aggregate 3-day data → call Claude → format →
+    send. When reply_chat_id is provided, sends via the SECONDARY
+    bot to that single chat (used by the /lore command). Otherwise
+    broadcasts via the PRIMARY bot to all authorised chat IDs (used
+    by the Mon/Thu/Sun scheduler).
+
+    Returns True if a Telegram message was sent (whether the
+    analysis itself succeeded or fell back to an error notification).
+    Returns False only when even the error notification couldn't be
+    delivered (no chat IDs / no token).
+    """
+    metrics       = _load_json_or(LORE_METRICS_FILE,       {})
+    closed_trades = _load_json_or(LORE_CLOSED_TRADES_FILE, [])
+    if not isinstance(metrics, dict):       metrics = {}
+    if not isinstance(closed_trades, list): closed_trades = []
+
+    data = _aggregate_3day_group_data(wallets, metrics, closed_trades)
+
+    def _do_send(body: str) -> bool:
+        if reply_chat_id:
+            return send_telegram_lore_reply(reply_chat_id, body)
+        return send_telegram(body)
+
+    if not data["groups"]:
+        body = (
+            "🧠 <b>LORE ANALYSIS — 3-day review</b>\n\n"
+            "No qualifying group activity in the last 3 days.\n\n"
+            f"Updated: {data['as_of_perth']}"
+        )
+        logger.info("[CLAUDE] Skipping API call — no 3-day group activity")
+        return _do_send(body)
+
+    parsed = await _request_lore_analysis_from_claude(data)
+    if parsed is None:
+        body = (
+            "🧠 <b>LORE ANALYSIS — 3-day review</b>\n\n"
+            "⚠️ Analysis failed — see logs/lore_tracker.log for details.\n\n"
+            f"Updated: {data['as_of_perth']}"
+        )
+        return _do_send(body)
+
+    body = _format_lore_analysis_message(parsed, wallets)
+    return _do_send(body)
+
+
+async def _lore_analysis_scheduler_loop(wallets: dict[str, dict]) -> None:
+    """Fire _send_lore_analysis on Mon/Thu/Sun at or after 09:00 Perth.
+    Same restart-safe pattern as the daily top-3 scheduler — persists
+    last_lore_analysis_date in lore_scheduler_state.json.
+    """
+    sched_state = _load_json_or(LORE_SCHEDULER_STATE_FILE, {})
+    if not isinstance(sched_state, dict):
+        sched_state = {}
+    weekday_labels = {0: "Mon", 3: "Thu", 6: "Sun"}
+    sched_days = ", ".join(weekday_labels[d] for d in sorted(LORE_ANALYSIS_WEEKDAYS))
+    logger.info(
+        f"[CLAUDE] Lore analysis scheduler started — {sched_days} at 09:00 Perth, "
+        f"last sent: {sched_state.get('last_lore_analysis_date') or 'never'}"
+    )
+
+    while True:
+        try:
+            now_perth     = datetime.now(PERTH_TZ)
+            today_str     = now_perth.date().isoformat()
+            last_sent     = sched_state.get("last_lore_analysis_date")
+            past_send_hr  = now_perth.hour >= LORE_ANALYSIS_PERTH_HOUR
+            is_sched_day  = now_perth.weekday() in LORE_ANALYSIS_WEEKDAYS
+            already_sent  = (last_sent == today_str)
+
+            if is_sched_day and past_send_hr and not already_sent:
+                logger.info(
+                    f"[CLAUDE] Firing scheduled lore analysis — "
+                    f"{now_perth.strftime('%a %H:%M')} Perth, last sent: {last_sent or 'never'}"
+                )
+                try:
+                    await _send_lore_analysis(wallets)
+                except Exception as e:
+                    logger.error(
+                        f"[CLAUDE] Scheduled analysis failed: {type(e).__name__}: {e}",
+                        exc_info=True,
+                    )
+                else:
+                    sched_state["last_lore_analysis_date"] = today_str
+                    # Re-load + re-write so we don't trample on the top-3
+                    # scheduler's last_top3_sent_date (both write the same
+                    # file). Belt-and-braces against race conditions.
+                    try:
+                        on_disk = _load_json_or(LORE_SCHEDULER_STATE_FILE, {})
+                        if isinstance(on_disk, dict):
+                            on_disk["last_lore_analysis_date"] = today_str
+                            _atomic_write_json(LORE_SCHEDULER_STATE_FILE, on_disk)
+                            sched_state = on_disk
+                    except OSError as e:
+                        logger.error(f"[CLAUDE] Scheduler state write failed: {e}")
+        except Exception as e:
+            logger.error(
+                f"[CLAUDE] Lore scheduler tick failed: {type(e).__name__}: {e}",
+                exc_info=True,
+            )
+        await asyncio.sleep(60)
+
+
+# --- /lore Telegram command listener (SECOND bot) ---------------------
+# Polls TELEGRAM_BOT_TOKEN_LORE getUpdates and replies to /lore via the
+# same bot. Runs on a completely separate Telegram bot to avoid the
+# collision problem with whale_sniper's existing command listener
+# documented in phase 4 design memo: two pollers on one bot would race
+# for updates and silently drop ~50% of commands.
+
+async def _lore_command_loop(wallets: dict[str, dict]) -> None:
+    token = os.getenv("TELEGRAM_BOT_TOKEN_LORE", "").strip()
+    if not token:
+        logger.error(
+            "TELEGRAM_BOT_TOKEN_LORE not set — /lore command DISABLED. "
+            "Scheduled reports + top-3 still active."
+        )
+        return  # task exits cleanly; the rest of the bot keeps running
+
+    base_url       = f"https://api.telegram.org/bot{token}"
+    last_update_id = 0
+    fail_count     = 0
+    authorised     = set(_telegram_chat_ids)
+    logger.info(
+        f"[LORE CMD] Listener started on secondary bot — authorised chats: "
+        f"{sorted(authorised) if authorised else 'NONE (no chat IDs configured)'}"
+    )
+
+    async with aiohttp.ClientSession() as session:
+        while True:
+            try:
+                params = {"timeout": 30, "offset": last_update_id + 1}
+                async with session.get(
+                    f"{base_url}/getUpdates",
+                    params=params,
+                    timeout=aiohttp.ClientTimeout(total=40),
+                ) as resp:
+                    resp.raise_for_status()
+                    data = await resp.json()
+                fail_count = 0
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                fail_count += 1
+                delay = min(5 * (2 ** (fail_count - 1)), 300)
+                logger.warning(
+                    f"[LORE CMD] getUpdates failed ({type(e).__name__}: {e!r}) — "
+                    f"retry in {delay}s (attempt {fail_count})"
+                )
+                await asyncio.sleep(delay)
+                continue
+
+            if not data.get("ok"):
+                logger.error(
+                    f"[LORE CMD] getUpdates error: {data.get('description', data)}"
+                )
+                await asyncio.sleep(5)
+                continue
+
+            for update in data.get("result", []):
+                last_update_id = max(last_update_id, update.get("update_id", 0))
+                msg  = update.get("message") or {}
+                text = (msg.get("text") or "").strip()
+                cid  = str(msg.get("chat", {}).get("id", ""))
+
+                if not text.startswith("/lore"):
+                    continue
+                if authorised and cid not in authorised:
+                    logger.warning(
+                        f"[LORE CMD] /lore from unauthorised chat {cid} — ignored"
+                    )
+                    continue
+
+                logger.info(f"[LORE CMD] /lore received from chat {cid} — running analysis")
+                try:
+                    await _send_lore_analysis(wallets, reply_chat_id=cid)
+                except Exception as e:
+                    logger.error(
+                        f"[LORE CMD] /lore handling failed: {type(e).__name__}: {e}",
+                        exc_info=True,
+                    )
+                    send_telegram_lore_reply(
+                        cid,
+                        "⚠️ /lore failed — see logs/lore_tracker.log",
+                    )
+
+
 # --- Polling ----------------------------------------------------------
 # Phase 1: poll all wallets at the ACTIVE interval. Dormant
 # classification arrives in phase 2 once metrics exist. The scaffolding
@@ -1343,9 +1840,11 @@ async def main() -> None:
             # on the Linux VPS but keeps local testing portable.
             pass
 
-    poll_task  = asyncio.create_task(_poll_loop(rpc_url, wallets))
-    sched_task = asyncio.create_task(_top3_scheduler_loop(wallets))
-    tasks = [poll_task, sched_task]
+    poll_task     = asyncio.create_task(_poll_loop(rpc_url, wallets))
+    top3_task     = asyncio.create_task(_top3_scheduler_loop(wallets))
+    analysis_task = asyncio.create_task(_lore_analysis_scheduler_loop(wallets))
+    cmd_task      = asyncio.create_task(_lore_command_loop(wallets))
+    tasks = [poll_task, top3_task, analysis_task, cmd_task]
     try:
         await stop_event.wait()
     finally:
@@ -1378,6 +1877,19 @@ async def _send_top3_oneshot() -> None:
     logger.info(f"[TOP3] manual one-shot — telegram sent: {sent_ok}")
 
 
+async def _send_lore_analysis_oneshot() -> None:
+    """Manual one-shot for the 3-day Claude analysis. Loads wallets,
+    runs the full aggregate → Claude → format → send pipeline,
+    broadcasts via the PRIMARY bot, exits. Does NOT touch
+    last_lore_analysis_date — using --send-lore-now does not block
+    or shift the next scheduled Mon/Thu/Sun run.
+    """
+    wallets = _load_lore_wallets()
+    logger.info("[CLAUDE] manual one-shot — composing 3-day analysis")
+    sent_ok = await _send_lore_analysis(wallets)
+    logger.info(f"[CLAUDE] manual one-shot — telegram delivered: {sent_ok}")
+
+
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="APEX lore tracker — observation-only wallet monitor."
@@ -1391,6 +1903,15 @@ def _parse_args() -> argparse.Namespace:
             "update the scheduler's last_top3_sent_date."
         ),
     )
+    p.add_argument(
+        "--send-lore-now",
+        action="store_true",
+        help=(
+            "Run the 3-day Claude analysis once and broadcast via the "
+            "PRIMARY bot, then exit. Manual smoke trigger; does NOT "
+            "update the scheduler's last_lore_analysis_date."
+        ),
+    )
     return p.parse_args()
 
 
@@ -1398,5 +1919,7 @@ if __name__ == "__main__":
     args = _parse_args()
     if args.send_top3_now:
         asyncio.run(_send_top3_oneshot())
+    elif args.send_lore_now:
+        asyncio.run(_send_lore_analysis_oneshot())
     else:
         asyncio.run(main())
