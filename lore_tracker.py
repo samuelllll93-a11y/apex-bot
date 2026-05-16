@@ -19,13 +19,16 @@ ping. Phases 2-4 add those layers.
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import json
 import logging
 import os
 import signal
 import time
+from datetime import datetime
 from logging.handlers import TimedRotatingFileHandler
+from zoneinfo import ZoneInfo
 
 import aiohttp
 import requests
@@ -68,6 +71,15 @@ LORE_WALLETS_FILE          = os.path.join(_HERE, "state", "lore_wallets.json")
 LORE_METRICS_FILE          = os.path.join(_HERE, "state", "lore_metrics.json")
 LORE_OPEN_POSITIONS_FILE   = os.path.join(_HERE, "state", "lore_open_positions.json")
 LORE_CLOSED_TRADES_FILE    = os.path.join(_HERE, "state", "lore_closed_trades.json")
+LORE_SCHEDULER_STATE_FILE  = os.path.join(_HERE, "state", "lore_scheduler_state.json")
+
+# Daily top-3 fires at this Perth-local hour. UTC+8 — so 9am Perth =
+# 01:00 UTC. The scheduler loop fires whenever (current Perth hour) is
+# >= this AND today's date string is not yet recorded in
+# lore_scheduler_state.json. That makes restarts mid-day idempotent and
+# misses get re-fired automatically.
+LORE_TOP3_PERTH_HOUR = 9
+PERTH_TZ = ZoneInfo("Australia/Perth")
 
 # Rolling window for closed-trade metrics — entries older than this
 # are pruned on each tick's write. 30 days matches the user spec for
@@ -697,6 +709,254 @@ def _recompute_wallet_metrics(
     })
 
 
+# --- Group aggregation + top-3 reporting ------------------------------
+# Group field in lore_wallets.json identifies the trader behind a set
+# of addresses. Multiple wallets per group is the norm (e.g. mannos
+# has "mannos" + "mannos2"). The top-3 ranking uses summed group PnL
+# over the last 24h. Overall 30-day group metrics are also exposed
+# via _aggregate_group_metrics for future /lore on-demand use.
+
+def _wallets_by_group(wallets: dict[str, dict]) -> dict[str, list[str]]:
+    """Return {group_name: [addr, ...]} from the wallet roster.
+    Wallets with missing/empty group fall under '?'.
+    """
+    by_group: dict[str, list[str]] = {}
+    for addr, meta in wallets.items():
+        group = ((meta or {}).get("group") or "?").strip() or "?"
+        by_group.setdefault(group, []).append(addr)
+    return by_group
+
+
+def _group_emoji(group: str, wallets: dict[str, dict]) -> str:
+    """Pick a representative emoji for a group — first non-empty
+    emoji across the group's members in wallet roster order. Returns
+    '' if no member has one.
+    """
+    for addr, meta in wallets.items():
+        m = meta or {}
+        if (m.get("group") or "").strip() == group:
+            emoji = (m.get("emoji") or "").strip()
+            if emoji:
+                return emoji
+    return ""
+
+
+def _aggregate_group_metrics(
+    wallets: dict[str, dict],
+    metrics: dict,
+) -> dict[str, dict]:
+    """Combine per-wallet rolling-30-day metrics into per-group totals.
+
+    Returns {group_name: {
+        members: [addr, ...],
+        trade_count: int,
+        win_count:   int,
+        win_rate:    float,           # 0..1
+        pnl_sol:     float,
+        last_activity_ts: float,
+        active_member_count: int,     # members with last_activity_ts >= 14d cutoff
+        dormant_member_count: int,
+        is_active_group: bool,        # True if at least one active member
+    }}.
+
+    Wallets with no metrics entry contribute zeros to counts and PnL
+    but still count toward member rosters.
+    """
+    cutoff = time.time() - LORE_DORMANT_THRESHOLD_DAYS * 86_400
+    by_group = _wallets_by_group(wallets)
+    out: dict[str, dict] = {}
+    for group, members in by_group.items():
+        trade_count = 0
+        win_count   = 0
+        pnl_sum     = 0.0
+        last_ts     = 0.0
+        active_n    = 0
+        dormant_n   = 0
+        for addr in members:
+            entry = metrics.get(addr) or {}
+            trade_count += int(entry.get("trade_count_30d") or 0)
+            win_count   += int(entry.get("win_count_30d")   or 0)
+            pnl_sum     += float(entry.get("total_pnl_sol_30d") or 0.0)
+            ts = float(entry.get("last_activity_ts") or 0)
+            if ts > last_ts:
+                last_ts = ts
+            # "Active" only if we've recorded a last_activity_ts and
+            # it's within the dormant cutoff. Wallets with no
+            # recorded activity yet count as neither — too early to
+            # tell.
+            if ts > 0:
+                if ts >= cutoff:
+                    active_n += 1
+                else:
+                    dormant_n += 1
+        out[group] = {
+            "members":              members,
+            "trade_count":          trade_count,
+            "win_count":            win_count,
+            "win_rate":             (win_count / trade_count) if trade_count else 0.0,
+            "pnl_sol":              round(pnl_sum, 9),
+            "last_activity_ts":     last_ts,
+            "active_member_count":  active_n,
+            "dormant_member_count": dormant_n,
+            "is_active_group":      active_n > 0,
+        }
+    return out
+
+
+def _top3_pnl_24h(
+    wallets: dict[str, dict],
+    closed_trades: list,
+) -> list[dict]:
+    """Compute the top-3 groups by realised PnL over the last 24h.
+
+    Filters closed_trades to those whose exit_time is within the
+    last 86,400 seconds, buckets them by group (looked up from
+    wallets[addr].group), sums pnl_sol / trade_count / win_count
+    per group, and returns the top 3 sorted by pnl_sol descending.
+
+    Returns fewer than 3 entries when fewer groups had qualifying
+    activity. Returns an empty list when no group did.
+    """
+    now    = time.time()
+    cutoff = now - 86_400
+    addr_to_group: dict[str, str] = {}
+    for addr, meta in wallets.items():
+        addr_to_group[addr] = ((meta or {}).get("group") or "?").strip() or "?"
+
+    groups: dict[str, dict] = {}
+    for t in closed_trades:
+        exit_t = float(t.get("exit_time") or 0)
+        if exit_t < cutoff:
+            continue
+        wallet = t.get("wallet") or ""
+        group  = addr_to_group.get(wallet, "?")
+        g = groups.setdefault(group, {
+            "group":       group,
+            "trade_count": 0,
+            "win_count":   0,
+            "pnl_sol":     0.0,
+        })
+        g["trade_count"] += 1
+        pnl = float(t.get("pnl_sol") or 0)
+        if pnl > 0:
+            g["win_count"] += 1
+        g["pnl_sol"] += pnl
+
+    for g in groups.values():
+        g["pnl_sol"]  = round(g["pnl_sol"], 9)
+        g["win_rate"] = (g["win_count"] / g["trade_count"]) if g["trade_count"] else 0.0
+        g["emoji"]    = _group_emoji(g["group"], wallets)
+
+    return sorted(groups.values(), key=lambda x: x["pnl_sol"], reverse=True)[:3]
+
+
+def _format_top3_message(top3: list[dict]) -> str:
+    """Render the top-3 Telegram body. Returns the empty-activity
+    message verbatim when top3 is [].
+    """
+    now_perth = datetime.now(PERTH_TZ)
+    timestamp_str = now_perth.strftime("%Y-%m-%d %H:%M Perth")
+
+    if not top3:
+        return (
+            f"🏆 <b>LORE TOP 3 — Last 24h</b>\n\n"
+            f"No qualifying activity in last 24h.\n\n"
+            f"Updated: {timestamp_str}"
+        )
+
+    lines = ["🏆 <b>LORE TOP 3 — Last 24h</b>", ""]
+    for i, g in enumerate(top3, 1):
+        sign       = "+" if g["pnl_sol"] >= 0 else ""
+        emoji_part = f" {g['emoji']}" if g.get("emoji") else ""
+        wr_pct     = int(round(g["win_rate"] * 100))
+        trade_word = "trade" if g["trade_count"] == 1 else "trades"
+        lines.append(
+            f"{i}. {g['group']}{emoji_part}  "
+            f"{sign}{g['pnl_sol']:.3f} SOL  "
+            f"({g['trade_count']} {trade_word}, {wr_pct}% WR)"
+        )
+    lines.append("")
+    lines.append(f"Updated: {timestamp_str}")
+    return "\n".join(lines)
+
+
+def _compose_top3_now(wallets: dict[str, dict]) -> str:
+    """Compose-only path: load closed trades from disk, compute top-3,
+    return the rendered string without sending. Used by --send-top3-now
+    (after sending) and could be used by phase 4's /lore handler.
+    """
+    closed_trades = _load_json_or(LORE_CLOSED_TRADES_FILE, [])
+    if not isinstance(closed_trades, list):
+        closed_trades = []
+    top3 = _top3_pnl_24h(wallets, closed_trades)
+    return _format_top3_message(top3), top3
+
+
+async def _send_daily_top3(wallets: dict[str, dict]) -> int:
+    """Compute the current top-3 and send it to all authorised
+    Telegram chat IDs. Returns the number of groups in the top-3
+    (0..3) so callers can log whether anything qualified.
+    """
+    msg, top3 = _compose_top3_now(wallets)
+    logger.info(
+        f"[TOP3] sending daily top-3 — {len(top3)} group(s) with 24h activity"
+    )
+    # send_telegram is sync requests-based (~5s timeout); a brief
+    # block on the event loop is acceptable and matches whale_sniper's
+    # pattern. Same applies to scheduled and on-demand paths.
+    send_telegram(msg)
+    return len(top3)
+
+
+async def _top3_scheduler_loop(wallets: dict[str, dict]) -> None:
+    """Fire _send_daily_top3 once per day at or after 09:00 Perth.
+    Idempotent across restarts via last_top3_sent_date persisted to
+    LORE_SCHEDULER_STATE_FILE.
+    """
+    sched_state = _load_json_or(LORE_SCHEDULER_STATE_FILE, {})
+    if not isinstance(sched_state, dict):
+        sched_state = {}
+    logger.info(
+        f"[TOP3] scheduler started — daily 09:00 Perth, "
+        f"last sent: {sched_state.get('last_top3_sent_date') or 'never'}"
+    )
+
+    while True:
+        try:
+            now_perth     = datetime.now(PERTH_TZ)
+            today_str     = now_perth.date().isoformat()
+            last_sent     = sched_state.get("last_top3_sent_date")
+            past_send_hr  = now_perth.hour >= LORE_TOP3_PERTH_HOUR
+            already_sent  = (last_sent == today_str)
+
+            if past_send_hr and not already_sent:
+                logger.info(
+                    f"[TOP3] firing daily send — Perth time "
+                    f"{now_perth.strftime('%H:%M')} >= {LORE_TOP3_PERTH_HOUR:02d}:00, "
+                    f"not yet sent today ({today_str})"
+                )
+                try:
+                    await _send_daily_top3(wallets)
+                except Exception as e:
+                    logger.error(
+                        f"[TOP3] send failed: {type(e).__name__}: {e}",
+                        exc_info=True,
+                    )
+                    # Don't mark as sent — try again next minute.
+                else:
+                    sched_state["last_top3_sent_date"] = today_str
+                    try:
+                        _atomic_write_json(LORE_SCHEDULER_STATE_FILE, sched_state)
+                    except OSError as e:
+                        logger.error(f"[TOP3] scheduler state write failed: {e}")
+        except Exception as e:
+            logger.error(
+                f"[TOP3] scheduler tick failed: {type(e).__name__}: {e}",
+                exc_info=True,
+            )
+        await asyncio.sleep(60)
+
+
 # --- Polling ----------------------------------------------------------
 # Phase 1: poll all wallets at the ACTIVE interval. Dormant
 # classification arrives in phase 2 once metrics exist. The scaffolding
@@ -869,12 +1129,24 @@ async def _poll_one_tick(
                 )
                 break
             txns_processed += 1
+            # "Active" is decoupled from "PnL-reconstructible". Any
+            # successfully fetched txn for the wallet counts as
+            # activity — covers (a) sell-only sub-wallets, (b)
+            # pre-baseline holders unwinding into our window,
+            # (c) creator wallets receiving allocations they later
+            # sell. Without this, those wallets would be flagged
+            # dormant despite trading actively.
+            blocktime = float(tx.get("blockTime") or time.time())
+            entry["last_activity_ts"] = max(
+                float(entry.get("last_activity_ts") or 0),
+                blocktime,
+            )
+
             trade = _extract_trade(tx, addr, sig, sol_usd_rate)
             if trade is None:
                 skipped_unrecognised += 1
                 continue
             applied = _apply_trade(trade, open_positions, closed_trades)
-            entry["last_activity_ts"] = trade["timestamp"]
             if trade["kind"] == "buy":
                 buys_recorded  += 1
                 wallet_buys    += 1
@@ -1071,17 +1343,60 @@ async def main() -> None:
             # on the Linux VPS but keeps local testing portable.
             pass
 
-    poll_task = asyncio.create_task(_poll_loop(rpc_url, wallets))
+    poll_task  = asyncio.create_task(_poll_loop(rpc_url, wallets))
+    sched_task = asyncio.create_task(_top3_scheduler_loop(wallets))
+    tasks = [poll_task, sched_task]
     try:
         await stop_event.wait()
     finally:
-        poll_task.cancel()
-        try:
-            await poll_task
-        except asyncio.CancelledError:
-            pass
+        for t in tasks:
+            t.cancel()
+        for t in tasks:
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
         logger.info("Lore tracker stopped")
 
 
+async def _send_top3_oneshot() -> None:
+    """Manual one-shot: load wallets + closed trades, compute the
+    current top-3, send to Telegram, exit. Used by --send-top3-now
+    for smoke testing. Does NOT touch lore_scheduler_state.json —
+    the next scheduled run will still fire as expected.
+    """
+    wallets = _load_lore_wallets()
+    msg, top3 = _compose_top3_now(wallets)
+    logger.info(
+        f"[TOP3] manual one-shot — composed top-3 with {len(top3)} group(s)"
+    )
+    # Print the rendered message so we see what's about to go out.
+    print("----- TOP-3 MESSAGE PREVIEW -----")
+    print(msg)
+    print("----- END PREVIEW -----")
+    sent_ok = send_telegram(msg)
+    logger.info(f"[TOP3] manual one-shot — telegram sent: {sent_ok}")
+
+
+def _parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="APEX lore tracker — observation-only wallet monitor."
+    )
+    p.add_argument(
+        "--send-top3-now",
+        action="store_true",
+        help=(
+            "Compute the current top-3 from on-disk state and send to "
+            "Telegram once, then exit. Manual smoke trigger; does NOT "
+            "update the scheduler's last_top3_sent_date."
+        ),
+    )
+    return p.parse_args()
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    args = _parse_args()
+    if args.send_top3_now:
+        asyncio.run(_send_top3_oneshot())
+    else:
+        asyncio.run(main())
