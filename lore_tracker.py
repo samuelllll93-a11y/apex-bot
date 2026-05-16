@@ -67,6 +67,33 @@ logger.addHandler(_file_handler)
 LORE_WALLETS_FILE          = os.path.join(_HERE, "state", "lore_wallets.json")
 LORE_METRICS_FILE          = os.path.join(_HERE, "state", "lore_metrics.json")
 LORE_OPEN_POSITIONS_FILE   = os.path.join(_HERE, "state", "lore_open_positions.json")
+LORE_CLOSED_TRADES_FILE    = os.path.join(_HERE, "state", "lore_closed_trades.json")
+
+# Rolling window for closed-trade metrics — entries older than this
+# are pruned on each tick's write. 30 days matches the user spec for
+# the per-wallet metrics window.
+LORE_METRICS_WINDOW_DAYS = 30
+
+# Dust threshold for declaring a position "fully closed". When
+# tokens_held drops below this fraction of the position's original
+# token count, the entry is removed from open_positions so it
+# doesn't linger forever for tokens that round to ~0 after a sell.
+LORE_DUST_FRACTION = 0.001   # 0.1% of original tokens
+
+# Cold-start cap: when a wallet has no last_processed_sig (first
+# time we poll it), process only the most recent N signatures to
+# seed metrics instead of trying to backfill its entire history.
+# Subsequent ticks process only sigs newer than last_processed_sig.
+LORE_COLD_START_SIG_LIMIT = 5
+
+# Lamports per SOL — used to convert native SOL balance deltas
+# (preBalances/postBalances are in lamports).
+LAMPORTS_PER_SOL = 1_000_000_000
+
+# SOL/USD price cache — refreshed lazily once per tick via Jupiter
+# quote (1 SOL → USDC). Used to normalise USDC/USDT trades to SOL
+# for the per-wallet metrics window. Marked APPROXIMATE in records.
+LORE_SOL_USD_CACHE_SEC = 300   # 5 min cache
 
 # Active wallets are polled every ACTIVE interval; dormant wallets
 # (no trade activity in LORE_DORMANT_THRESHOLD_DAYS) are polled less
@@ -248,6 +275,37 @@ def _load_lore_wallets() -> dict[str, dict]:
     return data
 
 
+def _atomic_write_json(path: str, data) -> None:
+    """Write JSON to `path` atomically: write to .tmp, fsync, then
+    os.replace. Mirrors whale_sniper's pattern for state files so a
+    crash mid-write can never leave a half-written JSON on disk.
+    """
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def _load_json_or(path: str, default):
+    """Load JSON from `path` or return `default` if missing/empty.
+    Logs a WARNING on parse error but returns `default` rather than
+    raising — phase 2 state files are derived and recoverable from
+    on-chain data; an unparseable file shouldn't kill the tracker.
+    """
+    if not os.path.exists(path):
+        return default
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+        return data
+    except (json.JSONDecodeError, OSError) as e:
+        logger.warning(f"Failed to load {path}: {type(e).__name__}: {e} — using default")
+        return default
+
+
 def _wallet_log_tag(addr: str, meta: dict) -> str:
     """Build a grep-friendly tag for log lines.
     Format: '[group/name addr8]' or '[? addr8]' for entries with no
@@ -258,6 +316,387 @@ def _wallet_log_tag(addr: str, meta: dict) -> str:
     return f"[{group}/{name} {addr[:8]}]"
 
 
+# --- Trade reconstruction ---------------------------------------------
+# Classifies a Helius getTransaction response into a buy or sell from
+# the lore wallet's perspective using only on-chain pre/post balances
+# (no protocol-specific decoding). PnL = (sell SOL value - cost basis
+# fraction) where SOL value is the wallet's native SOL delta (with fee
+# added back if the wallet was fee payer) plus any USDC/USDT delta
+# normalised via a cached Jupiter spot quote.
+
+_SOL_USD_RATE_CACHE = {"rate": 0.0, "fetched_at": 0.0}
+
+
+async def _get_sol_usd_rate(session: aiohttp.ClientSession) -> float:
+    """Return current SOL/USD rate via Jupiter spot quote. Cached
+    LORE_SOL_USD_CACHE_SEC. Falls back to last known rate (or 150.0)
+    on any error so trade reconstruction never blocks on a price
+    fetch failure.
+    """
+    now = time.time()
+    if (
+        _SOL_USD_RATE_CACHE["rate"] > 0
+        and now - _SOL_USD_RATE_CACHE["fetched_at"] < LORE_SOL_USD_CACHE_SEC
+    ):
+        return _SOL_USD_RATE_CACHE["rate"]
+    try:
+        url = "https://lite-api.jup.ag/swap/v1/quote"
+        params = {
+            "inputMint":   SOL_MINT,
+            "outputMint":  USDC_MINT,
+            "amount":      str(LAMPORTS_PER_SOL),   # 1 SOL
+            "slippageBps": "50",
+        }
+        async with session.get(
+            url, params=params, timeout=aiohttp.ClientTimeout(total=8)
+        ) as resp:
+            resp.raise_for_status()
+            data = await resp.json()
+        # USDC has 6 decimals — outAmount is in micro-USDC
+        rate = int(data.get("outAmount", 0)) / 1_000_000
+        if rate > 0:
+            _SOL_USD_RATE_CACHE["rate"] = rate
+            _SOL_USD_RATE_CACHE["fetched_at"] = now
+            return rate
+    except Exception as e:
+        logger.warning(f"SOL/USD rate fetch failed: {type(e).__name__}: {e}")
+    return _SOL_USD_RATE_CACHE["rate"] or 150.0
+
+
+async def _get_transaction(
+    session: aiohttp.ClientSession,
+    rpc_url: str,
+    sig: str,
+) -> dict | None:
+    """Fetch a parsed transaction by signature. Returns None on any
+    RPC error so the caller can skip and move on.
+    """
+    try:
+        result = await _arpc_post(
+            session, rpc_url, "getTransaction",
+            [sig, {
+                "encoding": "jsonParsed",
+                "commitment": "confirmed",
+                "maxSupportedTransactionVersion": 0,
+            }],
+        )
+        return result.get("result")
+    except aiohttp.ClientResponseError as e:
+        if e.status == 429:
+            logger.warning(f"[TX {sig[:16]}] Helius 429 — skipping this tick")
+        else:
+            logger.warning(f"[TX {sig[:16]}] getTransaction HTTP {e.status}: {e.message}")
+        return None
+    except Exception as e:
+        logger.warning(f"[TX {sig[:16]}] getTransaction failed: {type(e).__name__}: {e}")
+        return None
+
+
+def _wallet_token_deltas(tx: dict, wallet_addr: str) -> dict[str, float]:
+    """Return {mint: ui_amount_delta} for SPL tokens owned by the
+    wallet across this txn. Positive = received, negative = sent.
+    Tokens with zero net delta are excluded.
+
+    Handles the case where a token account appears in only one of
+    pre/postTokenBalances (a newly opened or fully closed token
+    account) by treating the missing side as 0.
+    """
+    meta = tx.get("meta") or {}
+    pre  = meta.get("preTokenBalances")  or []
+    post = meta.get("postTokenBalances") or []
+
+    # Build {(account_index, mint): ui_amount} for each side, scoped
+    # to entries owned by the wallet only.
+    def index(entries):
+        out: dict[tuple[int, str], float] = {}
+        for e in entries:
+            if e.get("owner") != wallet_addr:
+                continue
+            mint = e.get("mint")
+            if not mint:
+                continue
+            amt = (e.get("uiTokenAmount") or {}).get("uiAmount")
+            # uiAmount can be None when the account holds zero
+            out[(e.get("accountIndex"), mint)] = float(amt or 0.0)
+        return out
+
+    pre_idx  = index(pre)
+    post_idx = index(post)
+
+    # Sum deltas per mint across all the wallet's token accounts
+    # for that mint (most wallets have one, but be safe).
+    deltas: dict[str, float] = {}
+    all_keys = set(pre_idx) | set(post_idx)
+    for key in all_keys:
+        _, mint = key
+        delta = post_idx.get(key, 0.0) - pre_idx.get(key, 0.0)
+        if delta == 0.0:
+            continue
+        deltas[mint] = deltas.get(mint, 0.0) + delta
+
+    # Strip mints that net out to zero after summing
+    return {m: d for m, d in deltas.items() if d != 0.0}
+
+
+def _wallet_sol_delta(tx: dict, wallet_addr: str) -> float:
+    """Return the wallet's native SOL delta in SOL units (positive =
+    received). Adds the txn fee back if the wallet was the fee payer
+    (accountKeys index 0) so the trade-side SOL movement isn't
+    distorted by the priority fee.
+    """
+    meta = tx.get("meta") or {}
+    pre_balances  = meta.get("preBalances")  or []
+    post_balances = meta.get("postBalances") or []
+    fee_lamports  = int(meta.get("fee") or 0)
+    keys = (((tx.get("transaction") or {}).get("message") or {}).get("accountKeys") or [])
+
+    # accountKeys entries with jsonParsed encoding are dicts with
+    # "pubkey" — handle both dict and bare-string fallbacks.
+    def keystr(k):
+        if isinstance(k, dict):
+            return k.get("pubkey")
+        return k
+
+    wallet_idx = None
+    for i, k in enumerate(keys):
+        if keystr(k) == wallet_addr:
+            wallet_idx = i
+            break
+    if wallet_idx is None:
+        return 0.0
+    if wallet_idx >= len(pre_balances) or wallet_idx >= len(post_balances):
+        return 0.0
+
+    lamport_delta = post_balances[wallet_idx] - pre_balances[wallet_idx]
+    # Fee payer is accountKeys[0]. If the wallet paid the fee, add it
+    # back so the SOL delta reflects only the swap-side movement.
+    if wallet_idx == 0:
+        lamport_delta += fee_lamports
+    return lamport_delta / LAMPORTS_PER_SOL
+
+
+def _extract_trade(
+    tx: dict,
+    wallet_addr: str,
+    sig: str,
+    sol_usd_rate: float,
+) -> dict | None:
+    """Classify a successful txn as a BUY or SELL of one non-quote
+    token from the wallet's perspective. Returns a trade dict or
+    None if the txn is not a recognisable single-token swap.
+
+    Logic:
+      1. Compute wallet's SOL delta and USDC+USDT deltas (the
+         "quote" side, normalised to SOL).
+      2. Compute per-mint deltas for non-quote SPL tokens.
+      3. If exactly one non-quote token moved AND its sign opposes
+         the quote-side movement, classify as BUY (token +, quote -)
+         or SELL (token -, quote +). Multi-token swaps or
+         same-direction movements skip silently.
+    """
+    meta = tx.get("meta") or {}
+    if meta.get("err") is not None:
+        return None   # failed txn — didn't actually move funds
+
+    sol_delta = _wallet_sol_delta(tx, wallet_addr)
+    tok_deltas = _wallet_token_deltas(tx, wallet_addr)
+
+    # Split quote-currency deltas (USDC/USDT) from non-quote
+    quote_sol_value = sol_delta
+    if USDC_MINT in tok_deltas:
+        usdc_delta_sol = tok_deltas.pop(USDC_MINT) / sol_usd_rate
+        quote_sol_value += usdc_delta_sol
+    if USDT_MINT in tok_deltas:
+        usdt_delta_sol = tok_deltas.pop(USDT_MINT) / sol_usd_rate
+        quote_sol_value += usdt_delta_sol
+
+    # Filter out tokens whose net delta is essentially zero
+    tok_deltas = {m: d for m, d in tok_deltas.items() if abs(d) > 1e-9}
+
+    if len(tok_deltas) == 0:
+        return None   # no SPL token movement — pure transfer or SOL move
+    if len(tok_deltas) > 1:
+        # Token-to-token rotation or multi-token movement — beyond
+        # the scope of SOL-balance-delta PnL. Skip with debug.
+        logger.debug(
+            f"[TX {sig[:16]}] multi-token movement ({len(tok_deltas)} mints), skipping"
+        )
+        return None
+
+    token_mint, token_delta = next(iter(tok_deltas.items()))
+    blocktime = float(tx.get("blockTime") or time.time())
+
+    # BUY: token in (+), quote out (-)
+    if token_delta > 0 and quote_sol_value < 0:
+        return {
+            "kind":        "buy",
+            "wallet":      wallet_addr,
+            "token_mint":  token_mint,
+            "token_units": token_delta,
+            "sol_value":   abs(quote_sol_value),
+            "timestamp":   blocktime,
+            "signature":   sig,
+        }
+    # SELL: token out (-), quote in (+)
+    if token_delta < 0 and quote_sol_value > 0:
+        return {
+            "kind":        "sell",
+            "wallet":      wallet_addr,
+            "token_mint":  token_mint,
+            "token_units": abs(token_delta),
+            "sol_value":   quote_sol_value,
+            "timestamp":   blocktime,
+            "signature":   sig,
+        }
+    # Same-direction or zero movement — ambiguous. Common when the
+    # txn was a deposit / withdrawal / liquidity provision rather
+    # than a trade.
+    return None
+
+
+def _apply_trade(
+    trade: dict,
+    open_positions: dict,
+    closed_trades: list,
+) -> dict | None:
+    """Mutate open_positions and closed_trades in place to reflect
+    the trade. Buys add to a position (averaging cost basis);
+    sells realise PnL on the proportional cost basis and append a
+    record to closed_trades.
+
+    Returns:
+      - For BUYS: the open-position dict that was updated (no
+        closed-trades record is produced).
+      - For SELLS that landed: the closed-trade record just
+        appended to closed_trades.
+      - For SELLS skipped because we have no recorded buy
+        (pre-baseline history): None.
+
+    The return value lets the caller distinguish landed sells from
+    skipped ones for accurate per-sig logging without re-walking
+    closed_trades[-1] (which previously caused a stale-PnL bug
+    when a sell was skipped).
+    """
+    wallet = trade["wallet"]
+    mint   = trade["token_mint"]
+    wpos   = open_positions.setdefault(wallet, {})
+
+    if trade["kind"] == "buy":
+        existing = wpos.get(mint)
+        if existing:
+            existing["cost_basis_sol"] = round(
+                float(existing.get("cost_basis_sol") or 0) + trade["sol_value"], 9
+            )
+            existing["tokens_held"] = round(
+                float(existing.get("tokens_held") or 0) + trade["token_units"], 9
+            )
+            existing["last_buy_at"]  = trade["timestamp"]
+            existing["buys_count"]   = int(existing.get("buys_count") or 1) + 1
+            return existing
+        new_pos = {
+            "cost_basis_sol":   round(trade["sol_value"], 9),
+            "tokens_held":      round(trade["token_units"], 9),
+            "tokens_at_open":   round(trade["token_units"], 9),
+            "opened_at":        trade["timestamp"],
+            "last_buy_at":      trade["timestamp"],
+            "buys_count":       1,
+        }
+        wpos[mint] = new_pos
+        return new_pos
+
+    # trade["kind"] == "sell"
+    pos = wpos.get(mint)
+    if not pos or float(pos.get("tokens_held") or 0) <= 0:
+        logger.debug(
+            f"[TRADE] {wallet[:8]} sold {mint[:8]} with no recorded buy — "
+            f"skipping (pre-baseline history)"
+        )
+        return None
+
+    tokens_held    = float(pos["tokens_held"])
+    cost_basis_sol = float(pos["cost_basis_sol"])
+    tokens_sold    = min(trade["token_units"], tokens_held)
+    fraction_sold  = tokens_sold / tokens_held if tokens_held > 0 else 0.0
+    realised_cost  = cost_basis_sol * fraction_sold
+    realised_pnl   = trade["sol_value"] - realised_cost
+    realised_pct   = (realised_pnl / realised_cost * 100) if realised_cost > 0 else 0.0
+    hold_minutes   = max(
+        0.0, (trade["timestamp"] - float(pos.get("opened_at") or trade["timestamp"])) / 60.0
+    )
+
+    record = {
+        "wallet":         wallet,
+        "token_mint":     mint,
+        "entry_time":     float(pos.get("opened_at") or trade["timestamp"]),
+        "exit_time":      trade["timestamp"],
+        "entry_sol":      round(realised_cost, 9),
+        "exit_sol":       round(trade["sol_value"], 9),
+        "pnl_sol":        round(realised_pnl, 9),
+        "pnl_pct":        round(realised_pct, 4),
+        "hold_minutes":   round(hold_minutes, 2),
+        "fraction_sold":  round(fraction_sold, 6),
+        "signature":      trade["signature"],
+    }
+    closed_trades.append(record)
+
+    # Reduce the position
+    new_tokens = tokens_held - tokens_sold
+    new_basis  = cost_basis_sol - realised_cost
+    tokens_at_open = float(pos.get("tokens_at_open") or pos.get("tokens_held") or 1.0)
+    if new_tokens <= tokens_at_open * LORE_DUST_FRACTION:
+        # Position fully closed (or rounded down to dust)
+        del wpos[mint]
+        if not wpos:
+            del open_positions[wallet]
+    else:
+        pos["tokens_held"]    = round(new_tokens, 9)
+        pos["cost_basis_sol"] = round(max(new_basis, 0.0), 9)
+
+    return record
+
+
+def _prune_closed_trades(closed_trades: list) -> int:
+    """Remove entries older than LORE_METRICS_WINDOW_DAYS. Returns
+    the number of entries dropped. Called once per tick before write.
+    """
+    cutoff = time.time() - LORE_METRICS_WINDOW_DAYS * 86_400
+    before = len(closed_trades)
+    closed_trades[:] = [t for t in closed_trades if float(t.get("exit_time") or 0) >= cutoff]
+    return before - len(closed_trades)
+
+
+def _recompute_wallet_metrics(
+    wallet: str,
+    metrics: dict,
+    closed_trades: list,
+) -> None:
+    """Refresh derived rolling-window metrics for one wallet from
+    the closed_trades log. Preserves last_processed_sig and any
+    other per-wallet bookkeeping fields already in metrics.
+    """
+    wallet_trades = [t for t in closed_trades if t.get("wallet") == wallet]
+    trade_count   = len(wallet_trades)
+    win_count     = sum(1 for t in wallet_trades if float(t.get("pnl_sol") or 0) > 0)
+    pnl_sum       = sum(float(t.get("pnl_sol") or 0) for t in wallet_trades)
+    hold_sum      = sum(float(t.get("hold_minutes") or 0) for t in wallet_trades)
+
+    entry = metrics.setdefault(wallet, {})
+    entry.update({
+        "trade_count_30d":  trade_count,
+        "win_count_30d":    win_count,
+        "win_rate_30d":     round(win_count / trade_count, 4) if trade_count else 0.0,
+        "total_pnl_sol_30d": round(pnl_sum, 9),
+        "avg_hold_min":     round(hold_sum / trade_count, 2) if trade_count else 0.0,
+        # last_activity_ts is updated on each processed trade in
+        # _poll_one_tick; if we have closed trades, max(exit_time) is
+        # a safe lower bound when buys-without-sells haven't refreshed it.
+        "last_activity_ts": max(
+            float(entry.get("last_activity_ts") or 0),
+            max((float(t.get("exit_time") or 0) for t in wallet_trades), default=0.0),
+        ),
+    })
+
+
 # --- Polling ----------------------------------------------------------
 # Phase 1: poll all wallets at the ACTIVE interval. Dormant
 # classification arrives in phase 2 once metrics exist. The scaffolding
@@ -266,13 +705,21 @@ def _wallet_log_tag(addr: str, meta: dict) -> str:
 
 def _is_wallet_dormant(addr: str, metrics: dict) -> bool:
     """Return True if the wallet should be polled at the dormant
-    (60min) cadence instead of active (15min). Phase 1 stub: always
-    False. Phase 2 fills this in based on metrics[addr]['last_activity_ts'].
+    (60min) cadence instead of active (15min). A wallet is dormant
+    when we have a recorded last_activity_ts and it's older than
+    LORE_DORMANT_THRESHOLD_DAYS.
+
+    Wallets with no recorded activity (never seen a recognised
+    trade) are NOT dormant — they need active polling so we can
+    discover their first trade. Otherwise newly added wallets
+    would never get the polling cadence they need to seed metrics.
     """
-    # Placeholder so phase 2 can plug in without restructuring the
-    # poll loop.
-    _ = (addr, metrics)
-    return False
+    entry = metrics.get(addr) or {}
+    last  = float(entry.get("last_activity_ts") or 0)
+    if last <= 0:
+        return False
+    cutoff = time.time() - LORE_DORMANT_THRESHOLD_DAYS * 86_400
+    return last < cutoff
 
 
 async def _get_recent_signatures(
@@ -313,14 +760,19 @@ async def _poll_one_tick(
     rpc_url: str,
     wallets: dict[str, dict],
     metrics: dict,
+    open_positions: dict,
+    closed_trades: list,
     poll_dormant_this_tick: bool,
 ) -> None:
-    """One pass of the poll loop. Phase 1 just fetches sigs and logs
-    counts — no trade reconstruction. Wallet bucket (active vs
-    dormant) determines whether this tick visits it.
+    """One pass of the poll loop. Fetches new signatures per wallet,
+    reconstructs trades from on-chain pre/post balances, applies
+    them to open_positions and closed_trades, recomputes per-wallet
+    metrics, and persists all three state files atomically at the
+    end of the tick.
 
-    Calls are strictly sequential with LORE_RPC_GAP_SEC between to
-    avoid Helius 429 rate-limit bursts (see phase 1 smoke fix).
+    Wallet bucket (active vs dormant) determines whether this tick
+    visits it. Calls are strictly sequential with LORE_RPC_GAP_SEC
+    between to avoid Helius 429 rate-limit bursts.
     """
     active_pool   = []
     dormant_pool  = []
@@ -339,45 +791,172 @@ async def _poll_one_tick(
         f"{len(dormant_pool)} dormant ({'incl. dormant' if poll_dormant_this_tick else 'active only'})"
     )
 
-    tick_start = time.time()
-    total_sigs = 0
-    err_count  = 0
-    rate_limit_count = 0
+    # One SOL/USD fetch per tick (cached 5min internally — usually a
+    # no-op). Done early so it doesn't compete with the per-wallet
+    # processing for Jupiter bandwidth.
+    sol_usd_rate = await _get_sol_usd_rate(session)
+
+    tick_start          = time.time()
+    sigs_observed       = 0
+    txns_processed      = 0
+    buys_recorded       = 0
+    sells_recorded      = 0
+    skipped_unrecognised = 0
+    err_count           = 0
+
     for addr, meta in to_poll:
+        tag = _wallet_log_tag(addr, meta)
         try:
             sigs = await _get_recent_signatures(session, rpc_url, addr, meta)
         except Exception as e:
             err_count += 1
-            logger.warning(f"{_wallet_log_tag(addr, meta)} unexpected error: {type(e).__name__}: {e}")
+            logger.warning(f"{tag} unexpected error fetching sigs: {type(e).__name__}: {e}")
             sigs = []
-        sig_count = len(sigs)
-        total_sigs += sig_count
-        if sig_count == 0:
-            # _get_recent_signatures already logged the reason at WARNING
-            # if it was a 429 or other RPC failure. We only need a count
-            # of 429s here for the tick summary — re-fetch from log would
-            # be costly, so we approximate via a separate counter wired
-            # in via the future protocol-specific decode pass.
-            pass
+        sigs_observed += len(sigs)
+
+        if not sigs:
+            await asyncio.sleep(LORE_RPC_GAP_SEC)
+            continue
+
+        # Determine which sigs are NEW vs already-processed. sigs
+        # arrive newest-first from getSignaturesForAddress; we want
+        # to process oldest-first so buys land before sells in time
+        # order. Stop at the first sig that equals last_processed_sig.
+        entry = metrics.setdefault(addr, {})
+        last_processed = entry.get("last_processed_sig")
+        new_sigs: list[dict] = []
+        for s in sigs:
+            if s.get("signature") == last_processed:
+                break
+            new_sigs.append(s)
+
+        # Cold-start cap: on the first poll we've ever done for this
+        # wallet, only process the most recent N signatures. Backfilling
+        # everything would burn RPC credits and we'd still miss anything
+        # past the 10-sig fetch window.
+        if last_processed is None and len(new_sigs) > LORE_COLD_START_SIG_LIMIT:
+            logger.info(
+                f"{tag} cold start — capping to {LORE_COLD_START_SIG_LIMIT} most recent of "
+                f"{len(new_sigs)} signatures"
+            )
+            new_sigs = new_sigs[:LORE_COLD_START_SIG_LIMIT]
+
+        new_sigs.reverse()   # oldest first
+
+        if not new_sigs:
+            # Nothing new this tick — pace and move on.
+            await asyncio.sleep(LORE_RPC_GAP_SEC)
+            continue
+
+        logger.info(f"{tag} {len(new_sigs)} new signature(s) to reconstruct")
+        wallet_buys  = 0
+        wallet_sells = 0
+
+        for s in new_sigs:
+            sig = s.get("signature")
+            if not sig:
+                continue
+            await asyncio.sleep(LORE_RPC_GAP_SEC)
+            tx = await _get_transaction(session, rpc_url, sig)
+            if tx is None:
+                # RPC error — don't advance last_processed past this so
+                # we retry next tick. Break out of the new_sigs loop;
+                # the entries we've already processed are committed via
+                # the running open_positions/closed_trades mutation.
+                logger.warning(
+                    f"{tag} getTransaction returned None for {sig[:16]} — "
+                    f"halting reconstruction for this wallet this tick"
+                )
+                break
+            txns_processed += 1
+            trade = _extract_trade(tx, addr, sig, sol_usd_rate)
+            if trade is None:
+                skipped_unrecognised += 1
+                continue
+            applied = _apply_trade(trade, open_positions, closed_trades)
+            entry["last_activity_ts"] = trade["timestamp"]
+            if trade["kind"] == "buy":
+                buys_recorded  += 1
+                wallet_buys    += 1
+                logger.info(
+                    f"{tag} BUY  {trade['token_mint'][:8]} "
+                    f"{trade['token_units']:,.4f} for {trade['sol_value']:.4f} SOL"
+                )
+            elif applied is not None:
+                # Landed sell — `applied` is the closed-trade record
+                # just appended, so PnL fields are accurate per-sell.
+                sells_recorded += 1
+                wallet_sells   += 1
+                logger.info(
+                    f"{tag} SELL {trade['token_mint'][:8]} for "
+                    f"{trade['sol_value']:.4f} SOL "
+                    f"(PnL {applied['pnl_sol']:+.4f} SOL / "
+                    f"{applied['pnl_pct']:+.1f}%, "
+                    f"held {applied['hold_minutes']:.1f}m)"
+                )
+            else:
+                # Sell of a position we have no cost basis for.
+                # _apply_trade already logged at DEBUG; bump the
+                # skip counter so the tick summary reflects it.
+                skipped_unrecognised += 1
+                logger.debug(
+                    f"{tag} SELL {trade['token_mint'][:8]} skipped — "
+                    f"no recorded buy (pre-baseline)"
+                )
+            # Advance the watermark to this sig only after successful
+            # apply — so a mid-batch failure leaves the unprocessed
+            # tail to retry next tick.
+            entry["last_processed_sig"] = sig
         else:
-            tag = _wallet_log_tag(addr, meta)
-            logger.info(f"{tag} {sig_count} recent sigs (phase 1: not yet reconstructed)")
-        # Pacing gap — defence in depth even with dedicated Helius key
+            # All new_sigs processed without break — fast-forward the
+            # watermark to the newest sig in the batch in case some
+            # were skipped (unrecognised) without advancing it.
+            if new_sigs:
+                entry["last_processed_sig"] = new_sigs[-1]["signature"]
+
+        if wallet_buys or wallet_sells:
+            _recompute_wallet_metrics(addr, metrics, closed_trades)
+
         await asyncio.sleep(LORE_RPC_GAP_SEC)
+
+    # End-of-tick housekeeping: prune old closed trades, persist all
+    # three state files atomically.
+    pruned = _prune_closed_trades(closed_trades)
+    try:
+        _atomic_write_json(LORE_METRICS_FILE, metrics)
+        _atomic_write_json(LORE_OPEN_POSITIONS_FILE, open_positions)
+        _atomic_write_json(LORE_CLOSED_TRADES_FILE, closed_trades)
+    except OSError as e:
+        logger.error(f"[POLL] state file write failed: {type(e).__name__}: {e}")
 
     tick_dur = time.time() - tick_start
     logger.info(
-        f"[POLL] tick complete — {len(to_poll)} wallets polled in {tick_dur:.1f}s, "
-        f"{total_sigs} total sigs observed, {err_count} errors"
+        f"[POLL] tick complete — {len(to_poll)} wallets in {tick_dur:.1f}s | "
+        f"sigs_seen={sigs_observed} txns={txns_processed} "
+        f"buys={buys_recorded} sells={sells_recorded} "
+        f"skipped={skipped_unrecognised} errors={err_count} pruned={pruned}"
     )
     _maybe_log_hourly_helius_stats()
 
 
 async def _poll_loop(rpc_url: str, wallets: dict[str, dict]) -> None:
     """Run the polling loop forever at ACTIVE cadence. Every Nth tick
-    (where N = DORMANT / ACTIVE) also polls dormant wallets.
+    (where N = DORMANT / ACTIVE) also polls dormant wallets. State
+    files are loaded once at start and persisted at the end of each
+    tick via _poll_one_tick.
     """
-    metrics: dict = {}   # Phase 2 will load from LORE_METRICS_FILE here.
+    metrics:        dict = _load_json_or(LORE_METRICS_FILE,        {})
+    open_positions: dict = _load_json_or(LORE_OPEN_POSITIONS_FILE, {})
+    closed_trades:  list = _load_json_or(LORE_CLOSED_TRADES_FILE,  [])
+    if not isinstance(metrics, dict):        metrics = {}
+    if not isinstance(open_positions, dict): open_positions = {}
+    if not isinstance(closed_trades, list):  closed_trades = []
+    logger.info(
+        f"[POLL] state restored — metrics for {len(metrics)} wallets, "
+        f"{sum(len(v) for v in open_positions.values())} open positions across "
+        f"{len(open_positions)} wallets, {len(closed_trades)} closed trades"
+    )
+
     interval_sec   = LORE_POLL_INTERVAL_ACTIVE_MIN * 60
     dormant_every  = max(1, LORE_POLL_INTERVAL_DORMANT_MIN // LORE_POLL_INTERVAL_ACTIVE_MIN)
     tick = 0
@@ -388,7 +967,8 @@ async def _poll_loop(rpc_url: str, wallets: dict[str, dict]) -> None:
             poll_dormant_this_tick = (tick % dormant_every == 0)
             try:
                 await _poll_one_tick(
-                    session, rpc_url, wallets, metrics, poll_dormant_this_tick
+                    session, rpc_url, wallets, metrics,
+                    open_positions, closed_trades, poll_dormant_this_tick,
                 )
             except Exception as e:
                 logger.error(f"[POLL] tick {tick} failed: {type(e).__name__}: {e}", exc_info=True)
