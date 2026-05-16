@@ -633,9 +633,9 @@ def _apply_trade(
     """
     wallet = trade["wallet"]
     mint   = trade["token_mint"]
-    wpos   = open_positions.setdefault(wallet, {})
 
     if trade["kind"] == "buy":
+        wpos = open_positions.setdefault(wallet, {})
         existing = wpos.get(mint)
         if existing:
             existing["cost_basis_sol"] = round(
@@ -658,7 +658,10 @@ def _apply_trade(
         wpos[mint] = new_pos
         return new_pos
 
-    # trade["kind"] == "sell"
+    # trade["kind"] == "sell" — look up without creating an entry,
+    # so a skipped sell doesn't leave an empty wallet dict behind in
+    # open_positions (which would pollute state file writes).
+    wpos = open_positions.get(wallet) or {}
     pos = wpos.get(mint)
     if not pos or float(pos.get("tokens_held") or 0) <= 0:
         logger.debug(
