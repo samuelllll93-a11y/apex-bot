@@ -7,3 +7,12 @@ __pycache__/
 .DS_Store
 chromadb/
 .venv/
+
+# Lore tracker runtime state — derived from on-chain data and rebuildable
+# (with the cold-start cap caveat). state/lore_wallets.json is the
+# operator-curated roster and is NOT auto-ignored; commit it explicitly
+# when you want it tracked.
+state/lore_metrics.json
+state/lore_open_positions.json
+state/lore_closed_trades.json
+state/lore_scheduler_state.json
