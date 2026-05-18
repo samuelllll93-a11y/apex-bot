@@ -2342,6 +2342,16 @@ async def check_and_maybe_exit(
     if pos is None:
         return  # already closed by a concurrent check
 
+    # Guard: skip positions with no on-chain balance (e.g. dry-run simulated
+    # entries, or buys that recorded but never executed). Without this guard
+    # the loop hammers Jupiter with amount=0 quotes and spams sell-abort logs.
+    if not pos.get("amount_tokens"):
+        logger.debug(
+            f"[{token_mint[:8]}] skipping monitor — amount_tokens=0 "
+            f"(source={pos.get('source', '?')}, whale={pos.get('whale', '?')})"
+        )
+        return
+
     entry_sol      = pos["entry_sol"]
     mc_entry       = pos.get("mc_entry", 0.0)
 
