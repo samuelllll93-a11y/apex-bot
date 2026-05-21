@@ -2708,10 +2708,19 @@ async def check_and_maybe_exit(
             f"[{token_mint[:8]}] on-chain balance is 0 — aborting sell "
             f"(trigger: {exit_reason})"
         )
+        # Purge the stale entry: tokens are gone from wallet, no sell will ever
+        # succeed. Without this, every monitor tick re-enters this branch,
+        # re-fires Telegram alerts, and never resolves.
+        del open_positions[token_mint]
+        _save_positions()
+        _sell_failure_counts.pop(token_mint, None)
+        logger.warning(
+            f"POSITION_PURGED | {int(time.time())} | {_exit_label} | reason: zero_on_chain_balance"
+        )
         send_telegram(
-            f"⚠️ <b>SELL ABORTED</b> — {_exit_label}\n"
+            f"⚠️ <b>SELL ABORTED & PURGED</b> — {_exit_label}\n"
             f"Trigger: {exit_reason}\n"
-            f"Wallet shows no token balance on-chain"
+            f"Wallet shows no token balance on-chain — position removed"
         )
         return
     open_positions[token_mint]["amount_tokens"] = _exit_live_tokens
