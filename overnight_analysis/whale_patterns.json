@@ -1,0 +1,82 @@
+{
+  "generated_at": "2026-05-20T18:00:00Z",
+  "window_start": "2026-05-11T00:00:00Z",
+  "window_end": "2026-05-12T23:59:59Z",
+  "whales": {
+    "crispy": {
+      "entry_mcap_buckets": {"<50k": 6, "50k-250k": 0, "250k-1M": 0, "1M-5M": 0, ">5M": 0},
+      "token_traits": {
+        "bonded_pct": null,
+        "unbonded_pct": null,
+        "holder_count_median": null,
+        "top10_concentration_median_pct": null,
+        "note": "All entries are PumpFun bonding-curve tokens (pump suffix). Holder/concentration fields not logged."
+      },
+      "hold_duration_seconds": {
+        "winners_median": 360,
+        "losers_median": 1530
+      },
+      "exit_reasons": {
+        "take_profit": 0,
+        "trailing_stop": 1,
+        "hard_sell_floor": 0,
+        "whale_full_exit": 3,
+        "time_stop": 0,
+        "manual": 3,
+        "other": 0
+      },
+      "win_rate_by_tier_pct": {
+        "<50k": 50.0,
+        "50k-250k": null,
+        "250k-1M": null,
+        "1M-5M": null,
+        ">5M": null
+      },
+      "n_entries": 7,
+      "n_exits": 7,
+      "n_wins": 3,
+      "n_losses": 4,
+      "overall_win_rate_pct": 42.9,
+      "entry_mcap_range_usd": {"min": 5300, "max": 18800},
+      "note": "1 trade (domi) entered before log window — MC unknown, excluded from mcap buckets. All known MC entries are PumpFun pre-graduation sub-$20K."
+    },
+    "mannos": {
+      "entry_mcap_buckets": {"<50k": 11, "50k-250k": 0, "250k-1M": 0, "1M-5M": 0, ">5M": 0},
+      "token_traits": {
+        "bonded_pct": null,
+        "unbonded_pct": null,
+        "holder_count_median": null,
+        "top10_concentration_median_pct": null,
+        "note": "All entries are PumpFun bonding-curve tokens (pump suffix). Holder/concentration fields not logged."
+      },
+      "hold_duration_seconds": {
+        "winners_median": 420,
+        "losers_median": 210
+      },
+      "exit_reasons": {
+        "take_profit": 0,
+        "trailing_stop": 2,
+        "hard_sell_floor": 0,
+        "whale_full_exit": 3,
+        "time_stop": 0,
+        "manual": 6,
+        "other": 0
+      },
+      "win_rate_by_tier_pct": {
+        "<50k": 27.3,
+        "50k-250k": null,
+        "250k-1M": null,
+        "1M-5M": null,
+        ">5M": null
+      },
+      "n_entries": 11,
+      "n_exits": 11,
+      "n_wins": 3,
+      "n_losses": 8,
+      "overall_win_rate_pct": 27.3,
+      "entry_mcap_range_usd": {"min": 4600, "max": 28600},
+      "note": "Bot was in LOW_BALANCE state for most of May 12-13; many BUY signals skipped. Manual sells account for 6 of 11 exits. Winner MCs ($6.8K, $11.1K, $11.5K) all below $12K — tentative entry sweet spot."
+    }
+  },
+  "notes": "First run — no prior snapshot to compare against. Active trade window is 2026-05-11 to 2026-05-12 only; files from 2026-05-13 to 2026-05-21 show BUY signals but no executed trades (bot was in LOW_BALANCE or skip state). Token trait fields (holder count, top-10 concentration, bonded/unbonded) are not present in whale_sniper.log and cannot be computed. All entries observed are PumpFun bonding-curve tokens. Mcap buckets above $50K are structurally zero in this dataset — a $50K entry filter appears to be active (confirmed by SKIP messages citing mcap above $50K threshold)."
+}
