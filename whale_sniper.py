@@ -42,6 +42,54 @@ _file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name
 logger.addHandler(_file_handler)
 # ----------------------------------------------------------------------
 
+# --- Confidence calibration log ---------------------------------------
+# Plain-text append-only log of Claude score vs. eventual trade outcome.
+# Format:
+#   CONFIDENCE_LOG | <unix_ts> | <token_name> | <score|UNKNOWN> | BUY|HOLD | outcome_pending
+#   OUTCOME_LOG    | <unix_ts> | <token_name> | <score|UNKNOWN> | BUY      | <outcome> | <pnl_pct|NA>
+_CONF_LOG_PATH = os.path.join(_log_dir, "confidence_calibration.log")
+
+
+def _fmt_conf_score(score) -> str:
+    """Render a confidence score for the log: int or UNKNOWN."""
+    return str(score) if isinstance(score, int) else "UNKNOWN"
+
+
+def _log_confidence(token_name: str, score, decision: str) -> None:
+    """Append a CONFIDENCE_LOG entry. Never raises."""
+    try:
+        safe_name = (token_name or "?").replace("|", "/").replace("\n", " ")
+        line = (
+            f"CONFIDENCE_LOG | {int(time.time())} | {safe_name} | "
+            f"{_fmt_conf_score(score)} | {decision} | outcome_pending\n"
+        )
+        with open(_CONF_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(line)
+    except Exception as e:
+        logger.warning(f"confidence_calibration log write failed: {e}")
+
+
+def _log_outcome_for_position(pos: dict, token_mint: str, outcome: str, pnl_pct) -> None:
+    """Append an OUTCOME_LOG entry for a closing position. Never raises.
+    `pos` is the position dict (must still be valid — call BEFORE del).
+    `pnl_pct` may be None if not known (e.g. zero-balance purge).
+    """
+    try:
+        token_name = pos.get("token_label") or token_mint[:8]
+        safe_name  = token_name.replace("|", "/").replace("\n", " ")
+        score      = pos.get("claude_score")
+        score_s    = _fmt_conf_score(score) if isinstance(score, int) else "UNKNOWN"
+        pnl_s      = f"{pnl_pct:+.2f}" if isinstance(pnl_pct, (int, float)) else "NA"
+        line = (
+            f"OUTCOME_LOG | {int(time.time())} | {safe_name} | "
+            f"{score_s} | BUY | {outcome} | {pnl_s}\n"
+        )
+        with open(_CONF_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(line)
+    except Exception as e:
+        logger.warning(f"confidence_calibration log write failed: {e}")
+# ----------------------------------------------------------------------
+
 # --- Config -----------------------------------------------------------
 
 JUPITER_API      = "https://lite-api.jup.ag/swap/v1"
@@ -248,6 +296,7 @@ def _abandon_unsellable_position(
     pnl_sol   = -entry_sol
     pnl_pct   = -100.0 if entry_sol > 0 else 0.0
 
+    _log_outcome_for_position(pos, token_mint, "abandoned_unsellable", pnl_pct)
     del open_positions[token_mint]
     _save_positions()
     _token_blacklist[token_mint] = time.time() + BLACKLIST_MINUTES * 60
@@ -1077,21 +1126,25 @@ async def get_claude_score(
     prebond_progress: float | None,
     context_note: str = "",
     pump_data: dict | None = None,
-) -> tuple[int, list[str] | None]:
+) -> tuple[int, list[str] | None, bool]:
     """
     Ask Claude to score a token's short-term trading potential 0-100.
 
-    Returns (score, bullets) where:
+    Returns (score, bullets, score_parsed) where:
       - bullets is a list of up to 4 short reasoning strings on success
       - bullets is None if the API was unavailable or the call failed (fail-open)
+      - score_parsed is True only when the SCORE: line was successfully
+        extracted from Claude's response. False means the returned `score`
+        is a fail-open default and the caller should log it as UNKNOWN in
+        the confidence calibration log.
 
-    Fails open at (70, None) if CLAUDE_API_KEY is absent or API call fails.
-    Never logs the API key value.
+    Fails open at (70, None, False) if CLAUDE_API_KEY is absent or API call
+    fails. Never logs the API key value.
     """
     api_key = os.getenv("CLAUDE_API_KEY", "")
     if not api_key:
         logger.warning("CLAUDE_API_KEY not set — Claude score defaulting to 70 (fail-open)")
-        return 70, None
+        return 70, None, False
 
     # --- Build mode-specific prompt ---
     _response_format = (
@@ -1193,11 +1246,13 @@ async def get_claude_score(
         lines  = [ln.strip() for ln in raw.splitlines() if ln.strip()]
 
         score   = 70  # fail-open default
+        score_parsed = False
         bullets: list[str] = []
         for line in lines:
             if line.upper().startswith("SCORE:"):
                 try:
                     score = max(0, min(100, int(line.split(":", 1)[1].strip())))
+                    score_parsed = True
                 except (ValueError, IndexError):
                     pass
             elif line.startswith("-"):
@@ -1208,10 +1263,10 @@ async def get_claude_score(
                     break
 
         logger.info(f"[CLAUDE] {token_mint[:8]} scored {score}/100 | {len(bullets)} reason(s)")
-        return score, bullets
+        return score, bullets, score_parsed
     except Exception as e:
         logger.warning(f"[CLAUDE] Scoring failed for {token_mint[:8]}: {e} — defaulting to 70")
-        return 70, None
+        return 70, None, False
 
 
 # --- Telegram message helpers -----------------------------------------
@@ -1488,12 +1543,17 @@ async def dip_sniper_loop(
             )
 
             # Get Claude score
-            claude_score, score_bullets = await get_claude_score(
+            claude_score, score_bullets, _score_parsed = await get_claude_score(
                 token_mint, pair, None,
                 f"dip sniper — {drop_pct:.0f}% drop from ATH of {ath:.6f} SOL"
             )
             _dip_approved  = claude_score >= DIP_SNIPER_MIN_SCORE
             _dip_label     = _token_label(token_mint, pair)
+            _log_confidence(
+                token_name=_dip_label,
+                score=claude_score if _score_parsed else None,
+                decision="BUY" if _dip_approved else "HOLD",
+            )
             _send_claude_score_alert(
                 token_label=_dip_label,
                 score=claude_score,
@@ -2443,6 +2503,7 @@ async def check_and_maybe_exit(
         # so a future re-entry of the same mint starts from a clean slate.
         _sell_failure_counts.pop(token_mint, None)
         _hsf_pnl_sol = current_sol - entry_sol
+        _log_outcome_for_position(pos, token_mint, "hard_sell_floor", pnl_pct)
         del open_positions[token_mint]
         _save_positions()
 
@@ -2523,6 +2584,7 @@ async def check_and_maybe_exit(
         # Success — close position. Clear any accumulated failure counter.
         _sell_failure_counts.pop(token_mint, None)
         _htp_pnl_sol = current_sol - entry_sol
+        _log_outcome_for_position(pos, token_mint, "hard_tp", pnl_pct)
         del open_positions[token_mint]
         _save_positions()
 
@@ -2711,6 +2773,7 @@ async def check_and_maybe_exit(
         # Purge the stale entry: tokens are gone from wallet, no sell will ever
         # succeed. Without this, every monitor tick re-enters this branch,
         # re-fires Telegram alerts, and never resolves.
+        _log_outcome_for_position(pos, token_mint, "zero_balance_purge", None)
         del open_positions[token_mint]
         _save_positions()
         _sell_failure_counts.pop(token_mint, None)
@@ -2771,6 +2834,7 @@ async def check_and_maybe_exit(
     # Clear any accumulated failure counter — successful sell resets the slate.
     _sell_failure_counts.pop(token_mint, None)
 
+    _log_outcome_for_position(pos, token_mint, exit_reason, pnl_pct)
     # Remove from open_positions *before* logging so monitor doesn't re-enter
     del open_positions[token_mint]
     _save_positions()
@@ -2894,6 +2958,7 @@ async def emergency_dump_check(
             )
             return
 
+    _log_outcome_for_position(pos, token_mint, "emergency_dump", pnl_pct)
     del open_positions[token_mint]
     _save_positions()
     _token_blacklist[token_mint] = time.time() + BLACKLIST_MINUTES * 60
@@ -3313,6 +3378,7 @@ async def _handle_sell_callback(
     if sell_pct >= 100:
         # Full sell — remove position
         _pnl_sol = expected_sol - entry_sol
+        _log_outcome_for_position(pos, token_mint, "manual_sell_100", pnl_pct)
         del open_positions[token_mint]
         _save_positions()
 
@@ -3972,7 +4038,7 @@ async def poll_whale(
                 f"time={tier['time_stop_min']}m"
             )
         else:
-            claude_score, score_bullets = await get_claude_score(
+            claude_score, score_bullets, _score_parsed = await get_claude_score(
                 token_mint,
                 dex_pair,
                 prebond_pct,   # None if not a pump.fun token or if graduated
@@ -3981,6 +4047,11 @@ async def poll_whale(
             )
             _whale_approved = claude_score >= WHALE_MIN_SCORE
             _whale_label    = _token_label(token_mint, dex_pair)
+            _log_confidence(
+                token_name=_whale_label,
+                score=claude_score if _score_parsed else None,
+                decision="BUY" if _whale_approved else "HOLD",
+            )
             _send_claude_score_alert(
                 token_label=_whale_label,
                 score=claude_score,
@@ -4357,7 +4428,7 @@ async def handle_cto_signal(
 
     # Step 5 — Claude scoring
     try:
-        claude_score, bullets = await get_claude_score(
+        claude_score, bullets, _score_parsed = await get_claude_score(
             token_mint,
             dex_pair=dex_pair,
             prebond_progress=prebond_pct,
@@ -4366,9 +4437,15 @@ async def handle_cto_signal(
         )
     except Exception as e:
         logger.warning(f"{PREFIX} Claude scoring failed: {e} — fail-open at 70")
-        claude_score, bullets = 70, None
+        claude_score, bullets, _score_parsed = 70, None, False
 
-    if claude_score < WHALE_MIN_SCORE:
+    _cto_approved = claude_score >= WHALE_MIN_SCORE
+    _log_confidence(
+        token_name=_token_label(token_mint, dex_pair),
+        score=claude_score if _score_parsed else None,
+        decision="BUY" if _cto_approved else "HOLD",
+    )
+    if not _cto_approved:
         logger.info(
             f"{PREFIX} Claude score {claude_score} below min {WHALE_MIN_SCORE} — NO-GO"
         )
