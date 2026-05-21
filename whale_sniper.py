@@ -63,11 +63,11 @@ LOW_BALANCE_SOL   = float(os.getenv("LOW_BALANCE_SOL", "0.05"))  # skip trade + 
 
 # Whale wallets to track
 WHALE_WALLETS: dict[str, str] = {
-    "peace":    "7b88jCzsirGfLmFMyr7BXbCaDGTtuq8oDTWusqWvLv38",
+    # "peace":    "7b88jCzsirGfLmFMyr7BXbCaDGTtuq8oDTWusqWvLv38",
     "crispy":   "EdbNfzVJjVZFsz1awBezeJpBaySLsckoZyPyaucy3g2R",
     "mannos":   "CAmNcBJ82xr1tzXrwZ6tZKwEFs26TG8kT6dJeR1bxjW9",
     # "mr.putin": "8mzCDvq5JWJh6Cus7XYnnwL2JGCVUXA3bDqaXmzCG5hn",  # disabled 2026-04-07
-    "peace2":   "6iZLfoaYvEAuuhnJEiSkwC9exmtMZehpkUVuFzb19sWc",
+    # "peace2":   "6iZLfoaYvEAuuhnJEiSkwC9exmtMZehpkUVuFzb19sWc",
     # "spsc":     "7S3E2L25kr6oN2cMP2GQ5tMEfg8jwcmoYo35vvv8rxhW",  # disabled 2026-04-08
     # "early":  "Bv2BAw5UmKxv5SBMWYKqpsh6eXKNGM2RKxJGpGPk5vmb",  # disabled 2026-03-31
 }
