@@ -2461,9 +2461,19 @@ async def check_and_maybe_exit(
         _hsf_live_tokens = await get_spl_token_balance(session, token_mint, wallet_pubkey)
         if _hsf_live_tokens <= 0:
             logger.warning(f"[HARD SELL FLOOR] {token_mint[:8]} | on-chain balance is 0 — aborting sell")
+            # Purge the stale entry: tokens are gone from wallet, no sell will ever
+            # succeed. Without this, every monitor tick re-enters the hard sell
+            # floor branch, re-fires Telegram alerts, and never resolves.
+            _log_outcome_for_position(pos, token_mint, "hard_sell_floor_zero_balance_purge", None)
+            del open_positions[token_mint]
+            _save_positions()
+            _sell_failure_counts.pop(token_mint, None)
+            logger.warning(
+                f"POSITION_PURGED | {int(time.time())} | {_hsf_label} | reason: hard_sell_floor_zero_balance"
+            )
             send_telegram(
-                f"⚠️ <b>HARD SELL FLOOR ABORTED</b> — {_hsf_label}\n"
-                f"Wallet shows no token balance on-chain"
+                f"⚠️ <b>HARD SELL FLOOR ABORTED & PURGED</b> — {_hsf_label}\n"
+                f"Wallet shows no token balance on-chain — position removed"
             )
             return
         open_positions[token_mint]["amount_tokens"] = _hsf_live_tokens
