@@ -2553,9 +2553,19 @@ async def check_and_maybe_exit(
         _htp_live_tokens = await get_spl_token_balance(session, token_mint, wallet_pubkey)
         if _htp_live_tokens <= 0:
             logger.warning(f"[HARD TP] {token_mint[:8]} | on-chain balance is 0 — aborting sell")
+            # Purge the stale entry: tokens are gone from wallet, no sell will
+            # ever succeed. Without this, every monitor tick re-enters the
+            # hard TP branch while pnl_pct stays above the threshold.
+            _log_outcome_for_position(pos, token_mint, "hard_tp_zero_balance_purge", None)
+            del open_positions[token_mint]
+            _save_positions()
+            _sell_failure_counts.pop(token_mint, None)
+            logger.warning(
+                f"POSITION_PURGED | {int(time.time())} | {_htp_label} | reason: hard_tp_zero_balance"
+            )
             send_telegram(
-                f"⚠️ <b>HARD TP ABORTED</b> — {_htp_label}\n"
-                f"Wallet shows no token balance on-chain"
+                f"⚠️ <b>HARD TP ABORTED & PURGED</b> — {_htp_label}\n"
+                f"Wallet shows no token balance on-chain — position removed"
             )
             return
         open_positions[token_mint]["amount_tokens"] = _htp_live_tokens
@@ -2640,9 +2650,19 @@ async def check_and_maybe_exit(
         _tp1_live_tokens = await get_spl_token_balance(session, token_mint, wallet_pubkey)
         if _tp1_live_tokens <= 0:
             logger.warning(f"[TP1] {token_mint[:8]} | on-chain balance is 0 — aborting partial sell")
+            # Purge the stale entry: tokens are gone from wallet, no partial
+            # sell will ever succeed. Without this, every monitor tick
+            # re-enters the TP1 branch while pnl_pct stays above +100%.
+            _log_outcome_for_position(pos, token_mint, "tp1_zero_balance_purge", None)
+            del open_positions[token_mint]
+            _save_positions()
+            _sell_failure_counts.pop(token_mint, None)
+            logger.warning(
+                f"POSITION_PURGED | {int(time.time())} | {_tp1_label} | reason: tp1_zero_balance"
+            )
             send_telegram(
-                f"⚠️ <b>TP1 ABORTED</b> — {_tp1_label}\n"
-                f"Wallet shows no token balance on-chain"
+                f"⚠️ <b>TP1 ABORTED & PURGED</b> — {_tp1_label}\n"
+                f"Wallet shows no token balance on-chain — position removed"
             )
             return
         open_positions[token_mint]["amount_tokens"] = _tp1_live_tokens
@@ -2943,9 +2963,19 @@ async def emergency_dump_check(
     if _emg_live_tokens <= 0:
         _emg_label = pos.get("token_label") or token_mint[:8]
         logger.warning(f"[{token_mint[:8]}] on-chain balance is 0 — aborting emergency sell")
+        # Purge the stale entry: tokens are gone from wallet, no emergency
+        # sell will ever succeed. Without this, every monitor tick re-enters
+        # the emergency dump branch while pnl stays below the threshold.
+        _log_outcome_for_position(pos, token_mint, "emergency_dump_zero_balance_purge", None)
+        del open_positions[token_mint]
+        _save_positions()
+        _sell_failure_counts.pop(token_mint, None)
+        logger.warning(
+            f"POSITION_PURGED | {int(time.time())} | {_emg_label} | reason: emergency_dump_zero_balance"
+        )
         send_telegram(
-            f"⚠️ <b>EMERGENCY SELL ABORTED</b> — {_emg_label}\n"
-            f"Wallet shows no token balance on-chain"
+            f"⚠️ <b>EMERGENCY SELL ABORTED & PURGED</b> — {_emg_label}\n"
+            f"Wallet shows no token balance on-chain — position removed"
         )
         return
     open_positions[token_mint]["amount_tokens"] = _emg_live_tokens
