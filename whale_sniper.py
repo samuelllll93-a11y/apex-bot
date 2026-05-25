@@ -111,13 +111,14 @@ LOW_BALANCE_SOL   = float(os.getenv("LOW_BALANCE_SOL", "0.05"))  # skip trade + 
 
 # Whale wallets to track
 WHALE_WALLETS: dict[str, str] = {
-    # "peace":    "7b88jCzsirGfLmFMyr7BXbCaDGTtuq8oDTWusqWvLv38",
-    "crispy":   "EdbNfzVJjVZFsz1awBezeJpBaySLsckoZyPyaucy3g2R",
-    "mannos":   "CAmNcBJ82xr1tzXrwZ6tZKwEFs26TG8kT6dJeR1bxjW9",
-    # "mr.putin": "8mzCDvq5JWJh6Cus7XYnnwL2JGCVUXA3bDqaXmzCG5hn",  # disabled 2026-04-07
-    # "peace2":   "6iZLfoaYvEAuuhnJEiSkwC9exmtMZehpkUVuFzb19sWc",
-    # "spsc":     "7S3E2L25kr6oN2cMP2GQ5tMEfg8jwcmoYo35vvv8rxhW",  # disabled 2026-04-08
-    # "early":  "Bv2BAw5UmKxv5SBMWYKqpsh6eXKNGM2RKxJGpGPk5vmb",  # disabled 2026-03-31
+    # Added 2026-05-25 — high performers from lore analysis
+    "chonkyy":       "7WpUUSnZ9BkfLv5XJ2CHVU4uuPrnxC9tH5tDP8gbSxRF",
+    "beanz":         "VJSDW6S74YXR4rRR9P4xwhMvLZJQMhrUb8XMFirUsy1",
+    "ramsec_side":   "5n593DWQkpfFgA69mS1MFWJDRZDCLcAuEsQYryqxi22Z",
+    "stattic_ramsec":"4VvdcB1Bde2qCPdbxkFcy79qk3cT1nMXFoGuhfhCa7gr",
+    # Disabled 2026-05-25 — underperforming (mannos 20% WR, crispy 13 days inactive)
+    # "crispy": "EdbNfzVJjVZFsz1awBezeJpBaySLsckoZyPyaucy3g2R",
+    # "mannos": "CAmNcBJ82xr1tzXrwZ6tZKwEFs26TG8kT6dJeR1bxjW9",
 }
 
 # Track the last seen signature per wallet to detect new txns
