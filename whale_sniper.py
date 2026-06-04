@@ -2458,27 +2458,33 @@ async def check_and_maybe_exit(
             f"hard sell={_hard_sell_mc:,.0f} ({_hsf_drop_pct:+.1f}% from entry) — selling 100%"
         )
 
-        # Fetch live on-chain balance and sync
-        _hsf_live_tokens = await get_spl_token_balance(session, token_mint, wallet_pubkey)
-        if _hsf_live_tokens <= 0:
-            logger.warning(f"[HARD SELL FLOOR] {token_mint[:8]} | on-chain balance is 0 — aborting sell")
-            # Purge the stale entry: tokens are gone from wallet, no sell will ever
-            # succeed. Without this, every monitor tick re-enters the hard sell
-            # floor branch, re-fires Telegram alerts, and never resolves.
-            _log_outcome_for_position(pos, token_mint, "hard_sell_floor_zero_balance_purge", None)
-            del open_positions[token_mint]
+        # Fetch live on-chain balance and sync. The live-balance zero-purge only
+        # applies to live trading: in DRY_RUN no real tokens are ever bought, so
+        # the on-chain balance is always 0 and this branch would otherwise purge
+        # every dry-run position before W/L accounting is reached.
+        if not DRY_RUN:
+            _hsf_live_tokens = await get_spl_token_balance(session, token_mint, wallet_pubkey)
+            if _hsf_live_tokens <= 0:
+                logger.warning(f"[HARD SELL FLOOR] {token_mint[:8]} | on-chain balance is 0 — aborting sell")
+                # Purge the stale entry: tokens are gone from wallet, no sell will ever
+                # succeed. Without this, every monitor tick re-enters the hard sell
+                # floor branch, re-fires Telegram alerts, and never resolves.
+                _log_outcome_for_position(pos, token_mint, "hard_sell_floor_zero_balance_purge", None)
+                del open_positions[token_mint]
+                _save_positions()
+                _sell_failure_counts.pop(token_mint, None)
+                logger.warning(
+                    f"POSITION_PURGED | {int(time.time())} | {_hsf_label} | reason: hard_sell_floor_zero_balance"
+                )
+                send_telegram(
+                    f"⚠️ <b>HARD SELL FLOOR ABORTED & PURGED</b> — {_hsf_label}\n"
+                    f"Wallet shows no token balance on-chain — position removed"
+                )
+                return
+            open_positions[token_mint]["amount_tokens"] = _hsf_live_tokens
             _save_positions()
-            _sell_failure_counts.pop(token_mint, None)
-            logger.warning(
-                f"POSITION_PURGED | {int(time.time())} | {_hsf_label} | reason: hard_sell_floor_zero_balance"
-            )
-            send_telegram(
-                f"⚠️ <b>HARD SELL FLOOR ABORTED & PURGED</b> — {_hsf_label}\n"
-                f"Wallet shows no token balance on-chain — position removed"
-            )
-            return
-        open_positions[token_mint]["amount_tokens"] = _hsf_live_tokens
-        _save_positions()
+        else:
+            _hsf_live_tokens = pos.get("amount_tokens", 0)
 
         if DRY_RUN:
             _hsf_sig = "DRY_RUN_HARD_SELL_FLOOR"
@@ -2550,27 +2556,31 @@ async def check_and_maybe_exit(
             f"entry={entry_sol:.4f} × {HARD_TP_MULT} — selling 100%"
         )
 
-        # Fetch live on-chain balance and sync to stored position
-        _htp_live_tokens = await get_spl_token_balance(session, token_mint, wallet_pubkey)
-        if _htp_live_tokens <= 0:
-            logger.warning(f"[HARD TP] {token_mint[:8]} | on-chain balance is 0 — aborting sell")
-            # Purge the stale entry: tokens are gone from wallet, no sell will
-            # ever succeed. Without this, every monitor tick re-enters the
-            # hard TP branch while pnl_pct stays above the threshold.
-            _log_outcome_for_position(pos, token_mint, "hard_tp_zero_balance_purge", None)
-            del open_positions[token_mint]
+        # Fetch live on-chain balance and sync to stored position. Live-balance
+        # zero-purge only applies to live trading (see DRY_RUN note above).
+        if not DRY_RUN:
+            _htp_live_tokens = await get_spl_token_balance(session, token_mint, wallet_pubkey)
+            if _htp_live_tokens <= 0:
+                logger.warning(f"[HARD TP] {token_mint[:8]} | on-chain balance is 0 — aborting sell")
+                # Purge the stale entry: tokens are gone from wallet, no sell will
+                # ever succeed. Without this, every monitor tick re-enters the
+                # hard TP branch while pnl_pct stays above the threshold.
+                _log_outcome_for_position(pos, token_mint, "hard_tp_zero_balance_purge", None)
+                del open_positions[token_mint]
+                _save_positions()
+                _sell_failure_counts.pop(token_mint, None)
+                logger.warning(
+                    f"POSITION_PURGED | {int(time.time())} | {_htp_label} | reason: hard_tp_zero_balance"
+                )
+                send_telegram(
+                    f"⚠️ <b>HARD TP ABORTED & PURGED</b> — {_htp_label}\n"
+                    f"Wallet shows no token balance on-chain — position removed"
+                )
+                return
+            open_positions[token_mint]["amount_tokens"] = _htp_live_tokens
             _save_positions()
-            _sell_failure_counts.pop(token_mint, None)
-            logger.warning(
-                f"POSITION_PURGED | {int(time.time())} | {_htp_label} | reason: hard_tp_zero_balance"
-            )
-            send_telegram(
-                f"⚠️ <b>HARD TP ABORTED & PURGED</b> — {_htp_label}\n"
-                f"Wallet shows no token balance on-chain — position removed"
-            )
-            return
-        open_positions[token_mint]["amount_tokens"] = _htp_live_tokens
-        _save_positions()
+        else:
+            _htp_live_tokens = pos.get("amount_tokens", 0)
 
         if DRY_RUN:
             _htp_sig = "DRY_RUN_HARD_TP_SIG"
@@ -2647,27 +2657,31 @@ async def check_and_maybe_exit(
         _tp1_label    = pos.get("token_label") or token_mint[:8]
         _sell_frac    = TAKE_PROFIT_PCT / 100.0          # e.g. 0.50 when env=0.50
 
-        # Fetch live on-chain balance and sync to stored position
-        _tp1_live_tokens = await get_spl_token_balance(session, token_mint, wallet_pubkey)
-        if _tp1_live_tokens <= 0:
-            logger.warning(f"[TP1] {token_mint[:8]} | on-chain balance is 0 — aborting partial sell")
-            # Purge the stale entry: tokens are gone from wallet, no partial
-            # sell will ever succeed. Without this, every monitor tick
-            # re-enters the TP1 branch while pnl_pct stays above +100%.
-            _log_outcome_for_position(pos, token_mint, "tp1_zero_balance_purge", None)
-            del open_positions[token_mint]
+        # Fetch live on-chain balance and sync to stored position. Live-balance
+        # zero-purge only applies to live trading (see DRY_RUN note above).
+        if not DRY_RUN:
+            _tp1_live_tokens = await get_spl_token_balance(session, token_mint, wallet_pubkey)
+            if _tp1_live_tokens <= 0:
+                logger.warning(f"[TP1] {token_mint[:8]} | on-chain balance is 0 — aborting partial sell")
+                # Purge the stale entry: tokens are gone from wallet, no partial
+                # sell will ever succeed. Without this, every monitor tick
+                # re-enters the TP1 branch while pnl_pct stays above +100%.
+                _log_outcome_for_position(pos, token_mint, "tp1_zero_balance_purge", None)
+                del open_positions[token_mint]
+                _save_positions()
+                _sell_failure_counts.pop(token_mint, None)
+                logger.warning(
+                    f"POSITION_PURGED | {int(time.time())} | {_tp1_label} | reason: tp1_zero_balance"
+                )
+                send_telegram(
+                    f"⚠️ <b>TP1 ABORTED & PURGED</b> — {_tp1_label}\n"
+                    f"Wallet shows no token balance on-chain — position removed"
+                )
+                return
+            open_positions[token_mint]["amount_tokens"] = _tp1_live_tokens
             _save_positions()
-            _sell_failure_counts.pop(token_mint, None)
-            logger.warning(
-                f"POSITION_PURGED | {int(time.time())} | {_tp1_label} | reason: tp1_zero_balance"
-            )
-            send_telegram(
-                f"⚠️ <b>TP1 ABORTED & PURGED</b> — {_tp1_label}\n"
-                f"Wallet shows no token balance on-chain — position removed"
-            )
-            return
-        open_positions[token_mint]["amount_tokens"] = _tp1_live_tokens
-        _save_positions()
+        else:
+            _tp1_live_tokens = pos.get("amount_tokens", 0)
 
         _sell_tokens  = int(_tp1_live_tokens * _sell_frac)
         _remain_tokens = _tp1_live_tokens - _sell_tokens
@@ -2793,32 +2807,36 @@ async def check_and_maybe_exit(
         return  # no exit condition met this tick
 
     # --- Execute sell --------------------------------------------------
-    # Fetch live on-chain balance and sync to stored position
-    _exit_live_tokens = await get_spl_token_balance(session, token_mint, wallet_pubkey)
-    if _exit_live_tokens <= 0:
-        _exit_label = pos.get("token_label") or token_mint[:8]
-        logger.warning(
-            f"[{token_mint[:8]}] on-chain balance is 0 — aborting sell "
-            f"(trigger: {exit_reason})"
-        )
-        # Purge the stale entry: tokens are gone from wallet, no sell will ever
-        # succeed. Without this, every monitor tick re-enters this branch,
-        # re-fires Telegram alerts, and never resolves.
-        _log_outcome_for_position(pos, token_mint, "zero_balance_purge", None)
-        del open_positions[token_mint]
+    # Fetch live on-chain balance and sync to stored position. Live-balance
+    # zero-purge only applies to live trading (see DRY_RUN note above).
+    if not DRY_RUN:
+        _exit_live_tokens = await get_spl_token_balance(session, token_mint, wallet_pubkey)
+        if _exit_live_tokens <= 0:
+            _exit_label = pos.get("token_label") or token_mint[:8]
+            logger.warning(
+                f"[{token_mint[:8]}] on-chain balance is 0 — aborting sell "
+                f"(trigger: {exit_reason})"
+            )
+            # Purge the stale entry: tokens are gone from wallet, no sell will ever
+            # succeed. Without this, every monitor tick re-enters this branch,
+            # re-fires Telegram alerts, and never resolves.
+            _log_outcome_for_position(pos, token_mint, "zero_balance_purge", None)
+            del open_positions[token_mint]
+            _save_positions()
+            _sell_failure_counts.pop(token_mint, None)
+            logger.warning(
+                f"POSITION_PURGED | {int(time.time())} | {_exit_label} | reason: zero_on_chain_balance"
+            )
+            send_telegram(
+                f"⚠️ <b>SELL ABORTED & PURGED</b> — {_exit_label}\n"
+                f"Trigger: {exit_reason}\n"
+                f"Wallet shows no token balance on-chain — position removed"
+            )
+            return
+        open_positions[token_mint]["amount_tokens"] = _exit_live_tokens
         _save_positions()
-        _sell_failure_counts.pop(token_mint, None)
-        logger.warning(
-            f"POSITION_PURGED | {int(time.time())} | {_exit_label} | reason: zero_on_chain_balance"
-        )
-        send_telegram(
-            f"⚠️ <b>SELL ABORTED & PURGED</b> — {_exit_label}\n"
-            f"Trigger: {exit_reason}\n"
-            f"Wallet shows no token balance on-chain — position removed"
-        )
-        return
-    open_positions[token_mint]["amount_tokens"] = _exit_live_tokens
-    _save_positions()
+    else:
+        _exit_live_tokens = pos.get("amount_tokens", 0)
 
     if DRY_RUN:
         sell_sig = "DRY_RUN_SELL_SIG"
@@ -2959,28 +2977,32 @@ async def emergency_dump_check(
         f"emergency exit (pnl={pnl_pct:.1f}%, threshold={EMERGENCY_DUMP_PCT:.0f}%)"
     )
 
-    # Fetch live on-chain balance and sync to stored position
-    _emg_live_tokens = await get_spl_token_balance(session, token_mint, wallet_pubkey)
-    if _emg_live_tokens <= 0:
-        _emg_label = pos.get("token_label") or token_mint[:8]
-        logger.warning(f"[{token_mint[:8]}] on-chain balance is 0 — aborting emergency sell")
-        # Purge the stale entry: tokens are gone from wallet, no emergency
-        # sell will ever succeed. Without this, every monitor tick re-enters
-        # the emergency dump branch while pnl stays below the threshold.
-        _log_outcome_for_position(pos, token_mint, "emergency_dump_zero_balance_purge", None)
-        del open_positions[token_mint]
+    # Fetch live on-chain balance and sync to stored position. Live-balance
+    # zero-purge only applies to live trading (see DRY_RUN note above).
+    if not DRY_RUN:
+        _emg_live_tokens = await get_spl_token_balance(session, token_mint, wallet_pubkey)
+        if _emg_live_tokens <= 0:
+            _emg_label = pos.get("token_label") or token_mint[:8]
+            logger.warning(f"[{token_mint[:8]}] on-chain balance is 0 — aborting emergency sell")
+            # Purge the stale entry: tokens are gone from wallet, no emergency
+            # sell will ever succeed. Without this, every monitor tick re-enters
+            # the emergency dump branch while pnl stays below the threshold.
+            _log_outcome_for_position(pos, token_mint, "emergency_dump_zero_balance_purge", None)
+            del open_positions[token_mint]
+            _save_positions()
+            _sell_failure_counts.pop(token_mint, None)
+            logger.warning(
+                f"POSITION_PURGED | {int(time.time())} | {_emg_label} | reason: emergency_dump_zero_balance"
+            )
+            send_telegram(
+                f"⚠️ <b>EMERGENCY SELL ABORTED & PURGED</b> — {_emg_label}\n"
+                f"Wallet shows no token balance on-chain — position removed"
+            )
+            return
+        open_positions[token_mint]["amount_tokens"] = _emg_live_tokens
         _save_positions()
-        _sell_failure_counts.pop(token_mint, None)
-        logger.warning(
-            f"POSITION_PURGED | {int(time.time())} | {_emg_label} | reason: emergency_dump_zero_balance"
-        )
-        send_telegram(
-            f"⚠️ <b>EMERGENCY SELL ABORTED & PURGED</b> — {_emg_label}\n"
-            f"Wallet shows no token balance on-chain — position removed"
-        )
-        return
-    open_positions[token_mint]["amount_tokens"] = _emg_live_tokens
-    _save_positions()
+    else:
+        _emg_live_tokens = pos.get("amount_tokens", 0)
 
     if DRY_RUN:
         sell_sig = "DRY_RUN_SELL_SIG"
@@ -3352,18 +3374,22 @@ async def _handle_sell_callback(
 
     token_label = pos.get("token_label") or token_mint[:8]
 
-    # Fetch live on-chain balance and sync to stored position
+    # Fetch live on-chain balance and sync to stored position. Live-balance
+    # zero-purge only applies to live trading (see DRY_RUN note above).
     wallet_pubkey_btn = os.getenv("WALLET_PUBLIC_KEY", "")
-    live_tokens = await get_spl_token_balance(tg_session, token_mint, wallet_pubkey_btn)
-    if live_tokens <= 0:
-        await _answer_callback(tg_session, base_url, callback_id,
-                               "No on-chain balance for this token.")
-        await _send_tg(tg_session, base_url, chat_id,
-                       f"⚠️ <b>SELL ABORTED</b> — {token_label}\n"
-                       f"Wallet shows no token balance on-chain")
-        return
-    open_positions[token_mint]["amount_tokens"] = live_tokens
-    _save_positions()
+    if not DRY_RUN:
+        live_tokens = await get_spl_token_balance(tg_session, token_mint, wallet_pubkey_btn)
+        if live_tokens <= 0:
+            await _answer_callback(tg_session, base_url, callback_id,
+                                   "No on-chain balance for this token.")
+            await _send_tg(tg_session, base_url, chat_id,
+                           f"⚠️ <b>SELL ABORTED</b> — {token_label}\n"
+                           f"Wallet shows no token balance on-chain")
+            return
+        open_positions[token_mint]["amount_tokens"] = live_tokens
+        _save_positions()
+    else:
+        live_tokens = pos.get("amount_tokens", 0)
 
     sell_tokens = int(live_tokens * sell_pct / 100)
     if sell_tokens <= 0:
