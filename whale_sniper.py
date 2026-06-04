@@ -42,6 +42,34 @@ _file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name
 logger.addHandler(_file_handler)
 # ----------------------------------------------------------------------
 
+# --- Security: redact Helius api-key from all log output --------------
+def _redact_url(url: str) -> str:
+    """Strip api-key query param from URLs/strings before logging."""
+    return re.sub(r'api-key=[^&\s"\']+', 'api-key=REDACTED', url)
+
+
+class _RedactApiKeyFilter(logging.Filter):
+    """Scrub api-key query params from every emitted log record. Defense in
+    depth: the key most often leaks via exception strings (e.g. a requests
+    HTTPError whose message embeds the full RPC URL), not via direct f-string
+    interpolation, so a record-level filter is the only reliable guarantee."""
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            msg = record.getMessage()
+            if "api-key=" in msg:
+                record.msg = _redact_url(msg)
+                record.args = ()
+        except Exception:
+            pass
+        return True
+
+
+_redact_filter = _RedactApiKeyFilter()
+_file_handler.addFilter(_redact_filter)
+for _root_handler in logging.getLogger().handlers:   # basicConfig StreamHandler → pm2 stderr log
+    _root_handler.addFilter(_redact_filter)
+# ----------------------------------------------------------------------
+
 # --- Confidence calibration log ---------------------------------------
 # Plain-text append-only log of Claude score vs. eventual trade outcome.
 # Format:
@@ -389,7 +417,7 @@ def get_recent_signatures(rpc_url: str, wallet: str, limit: int = 10) -> list[di
         )
         return result.get("result") or []
     except Exception as e:
-        logger.warning(f"getSignaturesForAddress failed for {wallet[:8]}: {e}")
+        logger.warning(_redact_url(f"getSignaturesForAddress failed for {wallet[:8]}: {e}"))
         return []
 
 
@@ -403,7 +431,7 @@ def get_transaction(rpc_url: str, sig: str) -> dict | None:
         )
         return result.get("result")
     except Exception as e:
-        logger.warning(f"getTransaction failed for {sig[:16]}: {e}")
+        logger.warning(_redact_url(f"getTransaction failed for {sig[:16]}: {e}"))
         return None
 
 
@@ -432,7 +460,7 @@ def get_sol_balance(rpc_url: str, wallet_pubkey: str) -> float:
         lamports = raw.get("value", 0)
         return lamports / 1_000_000_000
     except Exception as e:
-        logger.error(f"getBalance exception for {wallet_pubkey[:8]}…: {e}")
+        logger.error(_redact_url(f"getBalance exception for {wallet_pubkey[:8]}…: {e}"))
         return 0.0
 
 
@@ -473,7 +501,7 @@ async def get_spl_token_balance(
             total_raw += int(amount_str)
         return total_raw
     except Exception as e:
-        logger.error(f"[SPL BAL] getTokenAccountsByOwner failed for {token_mint[:8]}: {e}")
+        logger.error(_redact_url(f"[SPL BAL] getTokenAccountsByOwner failed for {token_mint[:8]}: {e}"))
         return 0
 
 
